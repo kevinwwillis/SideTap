@@ -498,7 +498,11 @@ def stop_all(names: tuple[str, ...] = PROCS) -> list[str]:  # noqa: vulture  (ca
         except ValueError:
             pf.unlink()
             continue
-        if _safe_kill(pid, expected, marker=_PROC_MARKERS.get(name)):
+        # A runwda.pid written before the tunneld link points at go-ios's
+        # `ios runwda`, whose WDA listens on every address: stop that one too.
+        if _safe_kill(pid, expected, marker=_PROC_MARKERS.get(name)) or (
+            name == "runwda" and _safe_kill(pid, legacy)
+        ):
             stopped.append(name)
         pf.unlink()
     return stopped
@@ -544,10 +548,13 @@ def start_tunnel() -> None:  # noqa: vulture  (called from admin.py/viewer.py, o
             "Register the task from an admin PowerShell: powershell -ExecutionPolicy Bypass "
             "-File scripts\\install_tunneld_task.ps1 -Python <the python.exe SideTap uses>"
         )
-    raise DeviceError(
-        "tunneld is running but has no tunnel to the phone: plug it in by USB, or "
-        "put it on the same Wi-Fi as this PC, and wake it."
-    )
+    try:
+        link.tunnel_for()
+    except link.LinkError as exc:
+        # tunnel_for() names a failed tunnel request (pairing, service) apart
+        # from "the phone is away"; pass that on instead of a generic remedy.
+        raise DeviceError(f"tunneld is running but has no tunnel to the phone: {exc}") from exc
+    # The tunnel came up just as the wait ended.
 
 
 def start_wda(bundle_id: str) -> None:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)

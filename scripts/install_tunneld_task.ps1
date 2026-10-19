@@ -5,10 +5,13 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tunneld_task.ps1 -Python <python.exe>
 # -Python is the interpreter SideTap's packages are installed in (pythonw.exe next to it runs the task).
 # -TaskName matches TUNNELD_TASK in .env (default "iPad tunneld").
+# -LogDir holds tunneld.log. It and the task's working directory stay outside the app folder,
+# so the running task never blocks the installer from replacing that folder.
 
 param(
     [Parameter(Mandatory = $true)][string]$Python,
     [string]$TaskName = 'iPad tunneld',
+    [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'SideTap\tunneld'),
     [switch]$NoStart
 )
 
@@ -23,7 +26,11 @@ $Script = Join-Path $PSScriptRoot 'tunneld.pyw'
 foreach ($f in $Pythonw, $Script) { if (-not (Test-Path $f)) { throw "missing $f" } }
 
 $user = "$env:USERDOMAIN\$env:USERNAME"
-$action = New-ScheduledTaskAction -Execute $Pythonw -Argument "`"$Script`"" -WorkingDirectory $Repo
+# tunneld.pyw creates $LogDir itself, as the task: a folder made here can land in an app
+# package's private copy of AppData (MSIX redirection) that the task never sees. The working
+# directory is the interpreter's folder, which always exists and is outside the app folder.
+$action = New-ScheduledTaskAction -Execute $Pythonw -Argument "`"$Script`" `"$LogDir`"" `
+    -WorkingDirectory (Split-Path -Parent $Pythonw)
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -31,7 +38,7 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
     -MultipleInstances IgnoreNew -StartWhenAvailable
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
     -Settings $settings -Description "pymobiledevice3 tunneld for SideTap ($Repo)" -Force | Out-Null
-Write-Host "Registered '$TaskName' -> $Pythonw $Script"
+Write-Host "Registered '$TaskName' -> $Pythonw $Script (log: $LogDir\tunneld.log)"
 if (-not $NoStart) {
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "Started '$TaskName'"

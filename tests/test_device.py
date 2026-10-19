@@ -353,6 +353,13 @@ def _tunnel_env(monkeypatch, listed_on_call, tunneld_up=True):
         return len(probes) >= listed_on_call
 
     monkeypatch.setattr(device, "tunnel_running", fake_running)
+
+    def fake_tunnel_for(udid=None):
+        if len(probes) >= listed_on_call:
+            return ("fd00::1", 5000, "usb")
+        raise device.link.LinkError("no tunnel to the phone: it is not on USB, or not on the same Wi-Fi")
+
+    monkeypatch.setattr(device.link, "tunnel_for", fake_tunnel_for)
     return clock, probes, started
 
 
@@ -431,3 +438,30 @@ def test_our_relay_pid_is_recognised(monkeypatch, tmp_path):
     (tmp_path / "relay.pid").write_text("4242", encoding="utf-8")
     monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "pythonw.exe -m phone_harness.relay")
     assert device.proc_status("relay") == "running"
+
+
+def test_down_stops_a_go_ios_runwda_left_from_before_the_tunneld_link(monkeypatch, tmp_path):
+    # Its WDA was started without USE_IP and listens on every address: dropping
+    # the pid file and leaving it running would keep it reachable from the LAN.
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    (tmp_path / "runwda.pid").write_text("5150", encoding="utf-8")
+    monkeypatch.setattr(device, "ios_path", lambda: "C:/npm/ios.exe")
+    monkeypatch.setattr(device, "_pid_image", lambda pid: "ios.exe")
+    monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "ios.exe runwda --bundleid x")
+    killed = []
+    monkeypatch.setattr(device.subprocess, "run", lambda cmd, **k: killed.append(cmd))
+    assert device.stop_all(("runwda",)) == ["runwda"]
+    assert killed and killed[0][:3] == ["taskkill", "/PID", "5150"]
+
+
+def test_start_tunnel_passes_on_why_the_tunnel_request_failed(monkeypatch):
+    monkeypatch.setattr(device.link, "tunneld_up", lambda timeout=3.0: True)
+    monkeypatch.setattr(device, "tunnel_running", lambda timeout=10.0: False)
+    monkeypatch.setattr(device, "_TUNNEL_READY_TIMEOUT", 0.0)
+
+    def failed(udid=None):
+        raise device.link.LinkError("no tunnel to the phone (tunneld's tunnel request failed: HTTP 500 PairingError)")
+
+    monkeypatch.setattr(device.link, "tunnel_for", failed)
+    with pytest.raises(device.DeviceError, match="HTTP 500 PairingError"):
+        device.start_tunnel()

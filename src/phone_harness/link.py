@@ -188,6 +188,11 @@ def run(fn: Callable[[Any], Awaitable[T]], udid: str | None = None, timeout: flo
         return _run_coroutine(bounded)
     except LinkError:
         raise
+    except TimeoutError as exc:  # its message is empty: say what timed out
+        raise LinkError(
+            f"the phone did not answer within {timeout:.0f} s at [{address}]:{port} "
+            "(asleep, locked, or the link changed); retry, or run: phone-harness up"
+        ) from exc
     except Exception as exc:  # transport, lockdown or DVT failure, named
         raise LinkError(f"{type(exc).__name__}: {exc}") from exc
 

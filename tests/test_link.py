@@ -245,3 +245,27 @@ def test_device_calls_work_from_inside_a_running_event_loop(monkeypatch):
         return link._run_coroutine(answer)
 
     assert asyncio.run(tool()) == 42
+
+
+def test_a_timeout_says_what_timed_out(monkeypatch):
+    monkeypatch.setattr(link, "tunnel_for", lambda udid=None: ("fd00::1", 5000, "wifi"))
+
+    class FakeRSD:
+        def __init__(self, addr):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+    import pymobiledevice3.remote.remote_service_discovery as rsd_mod
+
+    monkeypatch.setattr(rsd_mod, "RemoteServiceDiscoveryService", FakeRSD)
+
+    async def slow(rsd):
+        await asyncio.sleep(1)
+
+    with pytest.raises(link.LinkError, match="did not answer within"):
+        link.run(slow, timeout=0.01)

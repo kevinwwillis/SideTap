@@ -1,7 +1,11 @@
-"""Run pymobiledevice3's tunneld with no window, logging to .state/tunneld.log.
+"""Run pymobiledevice3's tunneld with no window, logging to <log dir>/tunneld.log.
+
+    pythonw scripts/tunneld.pyw [<log dir>]     (default: .state/ next to scripts/)
 
 Started by the "iPad tunneld" scheduled task (admin, at logon) that
-scripts/install_tunneld_task.ps1 registers.
+scripts/install_tunneld_task.ps1 registers, with a log dir outside the app folder:
+a running task holding its log or working directory there would block the
+installer from replacing the folder on update.
 tunneld keeps one tunnel per iPad over USB or Wi-Fi and lists them on 127.0.0.1:49151.
 pythonw has no console, so stdout and stderr go to a log file that is cut back to
 its last 2 MB at each start.
@@ -17,7 +21,8 @@ use it. Remove this patch once a pymobiledevice3 release passes loop="none" on W
 import sys
 from pathlib import Path
 
-LOG = Path(__file__).resolve().parents[1] / ".state" / "tunneld.log"
+LOG_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / ".state"
+LOG = LOG_DIR / "tunneld.log"
 KEEP = 2 * 1024 * 1024
 
 LOG.parent.mkdir(parents=True, exist_ok=True)
