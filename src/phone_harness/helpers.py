@@ -17,7 +17,7 @@ from .wda_client import WDAClient, WDAError, activity_file, redact_actions
 
 _client: WDAClient | None = None
 # Agent calls ride out a USB/Wi-Fi switch while the relay restarts WDA.
-_RECONNECT_WAIT = 30.0
+_RECONNECT_WAIT = 75.0  # admin.up() allows WDA 60 s to answer, plus the tunnel step
 
 
 def client() -> WDAClient:

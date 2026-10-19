@@ -515,6 +515,29 @@ def _safe_kill(pid: int, expected_prefix: str, tree: bool = True, marker: str | 
     return True
 
 
+def _kill_own(pid: int, expected_prefix: str, marker: str) -> bool:
+    """Kill `pid` and those descendants that are the same program, sparing the
+    rest. A venv's pythonw.exe is a launcher that runs the real interpreter as
+    its child, so a plain kill leaves the program running; a tree kill takes
+    everything it started, and the relay's self-heal starts WDA, so restarting
+    the relay used to kill WDA with it (seen 2026-10-18 23:36 ET)."""
+    import psutil
+
+    try:
+        same = [
+            child.pid
+            for child in psutil.Process(pid).children(recursive=True)
+            if marker in _pid_cmdline(child.pid)
+        ]
+    except (psutil.Error, OSError):
+        same = []
+    if not _safe_kill(pid, expected_prefix, tree=False, marker=marker):
+        return False
+    for child in same:
+        _safe_kill(child, expected_prefix, tree=False, marker=marker)
+    return True
+
+
 def proc_status(name: str) -> str:
     """'running', 'dead', or 'not started'."""
     pf = _pid_file(name)
@@ -559,9 +582,12 @@ def stop_all(names: tuple[str, ...] = PROCS) -> list[str]:  # noqa: vulture  (ca
             continue
         # A runwda.pid written before the tunneld link points at go-ios's
         # `ios runwda`, whose WDA listens on every address: stop that one too.
-        if _safe_kill(pid, expected, marker=_PROC_MARKERS.get(name)) or (
-            name == "runwda" and _safe_kill(pid, legacy)
-        ):
+        marker = _PROC_MARKERS.get(name)
+        if name in LEGACY_PROCS or marker is None:
+            killed = _safe_kill(pid, expected, marker=marker)
+        else:
+            killed = _kill_own(pid, expected, marker)
+        if killed or (name == "runwda" and _safe_kill(pid, legacy)):
             stopped.append(name)
         pf.unlink()
     return stopped

@@ -42,7 +42,6 @@ def _tunnel_address() -> str:
 
 
 _last_traffic = time.monotonic()  # bytes through either port, or a new connection
-_open: set[asyncio.StreamWriter] = set()  # both ends of every piped connection
 _gate: asyncio.Event | None = None  # set while an idle stop runs; new connections wait
 
 
@@ -51,40 +50,96 @@ def _touch() -> None:
     _last_traffic = time.monotonic()
 
 
-async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+class _Piped:
+    """One client connection piped to the phone."""
+
+    def __init__(self, client_w: asyncio.StreamWriter, dev_w: asyncio.StreamWriter, wda: bool):
+        self.client_w, self.dev_w, self.wda = client_w, dev_w, wda
+        self.cut = False
+
+    def cut_phone_side(self) -> None:
+        """Idle stop: drop only the phone side of a WDA connection. HTTP
+        clients keep it pooled, and a request already on its way in would be
+        lost with a bare close, which the client cannot tell from WDA dying
+        mid-call; instead it reaches _pipe_up after the cut and gets the
+        marked 503, which the client may retry."""
+        self.cut = True
+        self.dev_w.close()
+        if not self.wda:
+            self.client_w.close()
+
+
+_open: set[_Piped] = set()
+
+
+async def _pipe_up(client_r: asyncio.StreamReader, conn: _Piped) -> None:
+    """Client to phone. After a cut, the next request is answered, not sent."""
     try:
-        while data := await reader.read(65536):
+        while data := await client_r.read(65536):
             _touch()
-            writer.write(data)
-            await writer.drain()
+            if conn.cut:
+                await _answer_unreachable(
+                    client_r, conn.client_w, "WDA stopped while idle", head=data
+                )
+                conn.client_w.close()
+                return
+            conn.dev_w.write(data)
+            await conn.dev_w.drain()
     except (ConnectionError, OSError, asyncio.CancelledError):
         pass
     finally:
         try:
-            writer.close()
+            conn.dev_w.close()
         except Exception:
             pass
+
+
+async def _pipe_down(dev_r: asyncio.StreamReader, conn: _Piped) -> None:
+    """Phone to client. A cut WDA connection stays open for _pipe_up to answer."""
+    try:
+        while data := await dev_r.read(65536):
+            _touch()
+            conn.client_w.write(data)
+            await conn.client_w.drain()
+    except (ConnectionError, OSError, asyncio.CancelledError):
+        pass
+    finally:
+        if not (conn.cut and conn.wda):
+            try:
+                conn.client_w.close()
+            except Exception:
+                pass
 
 
 UNREACHABLE_HEADER = "X-Phone-Relay"  # value "unreachable"; read by wda_client
 
 
 async def _answer_unreachable(
-    client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter, reason: str
+    client_r: asyncio.StreamReader,
+    client_w: asyncio.StreamWriter,
+    reason: str,
+    head: bytes = b"",
 ) -> None:
     """Answer an HTTP request that never reached WDA with a marked 503.
 
-    The request is read first (headers and any body), so closing afterwards
-    does not reset the connection under the reply. Never raises."""
+    The request is read first (headers and any body; `head` is what was
+    already read of it), so closing afterwards does not reset the connection
+    under the reply. Never raises."""
     try:
-        head = await asyncio.wait_for(client_r.readuntil(b"\r\n\r\n"), timeout=2)
+        buf = head
+        while b"\r\n\r\n" not in buf:
+            chunk = await asyncio.wait_for(client_r.read(65536), timeout=2)
+            if not chunk:
+                return
+            buf += chunk
+        header, _, body_start = buf.partition(b"\r\n\r\n")
         length = 0
-        for line in head.split(b"\r\n"):
+        for line in header.split(b"\r\n"):
             name, _, value = line.partition(b":")
             if name.strip().lower() == b"content-length":
                 length = int(value.strip() or 0)
-        if length:
-            await asyncio.wait_for(client_r.readexactly(length), timeout=2)
+        if length > len(body_start):
+            await asyncio.wait_for(client_r.readexactly(length - len(body_start)), timeout=2)
         body = json.dumps(
             {"value": {"error": "wda unreachable", "message": f"relay: {reason}"}}
         ).encode()
@@ -168,12 +223,12 @@ def _handler(device_port: int):
                 _maybe_heal()
             return
         _last_failure = ""
-        pair = {client_w, dev_w}
-        _open.update(pair)
+        conn = _Piped(client_w, dev_w, wda=device_port == DEVICE_WDA_PORT)
+        _open.add(conn)
         try:
-            await asyncio.gather(_pipe(client_r, dev_w), _pipe(dev_r, client_w))
+            await asyncio.gather(_pipe_up(client_r, conn), _pipe_down(dev_r, conn))
         finally:
-            _open.difference_update(pair)
+            _open.discard(conn)
 
     return handle
 
@@ -213,14 +268,15 @@ async def _idle_check(idle_seconds: float) -> None:
     """Decide on the event loop, where every byte is piped, so nothing can be
     forwarded between "idle" and the gate closing: a request that reached WDA
     must never meet a WDA being killed under it (it could not be replayed).
-    Open connections are silent ones (pooled by HTTP clients); they are closed
-    so a client opens a fresh one, which waits at the gate and then starts WDA."""
+    Open connections are silent ones (pooled by HTTP clients); their phone
+    side is cut (see _Piped), and a fresh connection waits at the gate, then
+    starts WDA through the self-heal."""
     global _gate
     if _gate is not None or _healing or time.monotonic() - _last_traffic < idle_seconds:
         return
     _gate = asyncio.Event()
-    for writer in list(_open):
-        writer.close()
+    for conn in list(_open):
+        conn.cut_phone_side()
     try:
         await asyncio.to_thread(_idle_stop, idle_seconds)
     except Exception as exc:  # the relay must outlive a failed stop

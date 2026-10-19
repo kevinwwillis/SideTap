@@ -465,3 +465,46 @@ def test_start_tunnel_passes_on_why_the_tunnel_request_failed(monkeypatch):
     monkeypatch.setattr(device.link, "tunnel_for", failed)
     with pytest.raises(device.DeviceError, match="HTTP 500 PairingError"):
         device.start_tunnel()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="taskkill tree semantics")
+def test_stopping_the_relay_spares_the_wda_it_started(tmp_path, monkeypatch):
+    """Real processes: launcher -> interpreter (both the relay) -> WDA runner.
+    The relay's self-heal starts WDA as its child; a relay restart must not
+    take WDA down with it (2026-10-18 23:36 ET)."""
+    import subprocess
+    import time
+
+    import psutil
+
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    # the base interpreter: a venv's python.exe would add a launcher per level
+    exe = getattr(sys, "_base_executable", sys.executable)
+    marker = "phone_harness.relay"
+    sleeper = "import time; time.sleep(120)"
+    spawn = "import subprocess, time; subprocess.Popen([{exe!r}, '-c', {code!r}, {tag!r}]); time.sleep(120)"
+    interpreter = spawn.format(exe=exe, code=sleeper, tag="xcuitest")  # starts the "runner"
+    launcher = spawn.format(exe=exe, code=interpreter, tag=marker)
+    top = subprocess.Popen([exe, "-c", launcher, marker])
+    tree = []
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and len(tree) < 2:
+            time.sleep(0.2)
+            tree = psutil.Process(top.pid).children(recursive=True)
+        runner = [p for p in tree if p.cmdline()[-1] == "xcuitest"]
+        relay_interpreter = [p for p in tree if p not in runner]
+        assert len(runner) == 1 and len(relay_interpreter) == 1
+        (tmp_path / "relay.pid").write_text(str(top.pid), encoding="utf-8")
+        assert device.stop_all(("relay",)) == ["relay"]
+        time.sleep(1)
+        assert top.poll() is not None
+        assert not relay_interpreter[0].is_running()
+        assert runner[0].is_running()
+    finally:
+        for p in [*tree]:
+            try:
+                p.kill()
+            except psutil.Error:
+                pass
+        top.kill()
