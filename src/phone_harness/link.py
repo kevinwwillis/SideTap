@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from . import config
@@ -65,12 +68,57 @@ def _is_usb(entry: dict) -> bool:
     return not (":" in iface or iface.replace(".", "").isdigit())
 
 
+_REQUEST_INTERVAL = 10.0  # seconds between two tunnel requests to tunneld
+_last_request = -1e9
+
+
+def _known_udids() -> list[str]:
+    """Devices this PC could open a tunnel to: attached by USB, then remote-paired (Wi-Fi)."""
+    udids: list[str] = []
+    try:
+        from pymobiledevice3 import usbmux
+
+        udids += [d.serial for d in asyncio.run(usbmux.list_devices())]
+    except Exception:
+        pass
+    records = Path.home() / ".pymobiledevice3"
+    udids += sorted(p.stem.removeprefix("remote_") for p in records.glob("remote_*.plist"))
+    return list(dict.fromkeys(udids))
+
+
+def request_tunnel(udid: str, timeout: float = 15.0) -> bool:
+    """Ask tunneld to build a tunnel to `udid` now (its /start-tunnel API).
+
+    tunneld's own monitors miss one case: a device that was attached by USB while
+    it already had a Wi-Fi tunnel is never revisited when that tunnel drops,
+    because the USB monitor only acts on attach events (TASK-001.10). Asking is
+    cheap when a tunnel exists (tunneld returns it) and fails fast otherwise.
+    """
+    url = f"{TUNNELD_URL}/start-tunnel?udid={urllib.parse.quote(udid)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
 def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:
-    """(address, rsd port, "usb"|"wifi") of the device's tunnel, USB first."""
+    """(address, rsd port, "usb"|"wifi") of the device's tunnel, USB first.
+
+    With no tunnel listed, asks tunneld for one (at most every _REQUEST_INTERVAL)."""
+    global _last_request
     listing = tunnels()
     if udid is None:
         udid = config.SIDETAP_UDID or (sorted(listing)[0] if listing else None)
     entries = listing.get(udid or "", [])
+    now = time.monotonic()
+    if not entries and now - _last_request >= _REQUEST_INTERVAL:
+        _last_request = now
+        for candidate in [udid] if udid else _known_udids():
+            if request_tunnel(candidate):
+                udid = candidate
+                entries = tunnels().get(candidate, [])
+                break
     if not entries:
         raise LinkError(
             "no tunnel to the phone: it is not on USB, or not on the same Wi-Fi as this PC, "

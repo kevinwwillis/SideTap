@@ -30,6 +30,13 @@ class _Resp:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _no_tunnel_requests(monkeypatch):
+    # Tests never reach the real tunneld or usbmux; the request tests below opt in.
+    monkeypatch.setattr(link, "_last_request", float("inf"))
+    monkeypatch.setattr(link, "_known_udids", lambda: [])
+
+
 def _listing(monkeypatch, body):
     monkeypatch.setattr(link.urllib.request, "urlopen", lambda url, timeout=3.0: _Resp(body))
 
@@ -176,3 +183,40 @@ def test_no_tunnel_does_not_trigger_a_heal(monkeypatch):
         await relay._handler(relay.DEVICE_WDA_PORT)(asyncio.StreamReader(), Writer())
 
     asyncio.run(scenario())
+
+
+def test_no_tunnel_asks_tunneld_for_one(monkeypatch):
+    listings = iter([{}, {UDID: [USB]}])
+    asked = []
+
+    def urlopen(url, timeout=3.0):
+        if "/start-tunnel" in url:
+            asked.append(url)
+            r = _Resp({})
+            r.status = 200
+            return r
+        return _Resp(next(listings))
+
+    monkeypatch.setattr(link.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(link, "_last_request", -1e9)
+    monkeypatch.setattr(link, "_known_udids", lambda: [UDID])
+    assert link.tunnel_for() == ("fd11::1", 50001, "usb")
+    assert asked == [link.TUNNELD_URL + "/start-tunnel?udid=" + UDID]
+
+
+def test_tunnel_requests_are_rate_limited(monkeypatch):
+    asked = []
+
+    def urlopen(url, timeout=3.0):
+        if "/start-tunnel" in url:
+            asked.append(url)
+            raise link.urllib.error.HTTPError(url, 501, "task not created", {}, None)
+        return _Resp({})
+
+    monkeypatch.setattr(link.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(link, "_last_request", -1e9)
+    monkeypatch.setattr(link, "_known_udids", lambda: [UDID])
+    for _ in range(3):
+        with pytest.raises(link.LinkError, match="no tunnel to the phone"):
+            link.tunnel_for()
+    assert len(asked) == 1  # one request per interval, not one per connection
