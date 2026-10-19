@@ -83,7 +83,7 @@ def test_wda_bundle_none_when_empty_list_and_no_cache(monkeypatch, tmp_path):
 
 # ---- Developer Disk Image: an iOS update silently unmounts it (bit live
 # 2026-08-10, the 26.6 update) — runwda then dies in dtx channel timeouts.
-# `image list` prints a "signature" line when mounted, msg "none" when not.
+# The image mounter is asked through the tunnel (link.py).
 
 
 class _Proc:
@@ -93,26 +93,28 @@ class _Proc:
         self.returncode = returncode
 
 
-def test_ddi_mounted_sees_signature_line(monkeypatch):
-    out = (
-        '{"level":"INFO","msg":"no udid specified using first device in list"}\n'
-        '{"level":"INFO","msg":"image signature","signature":"28080689ce6e"}\n'
-    )
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+def test_ddi_mounted_asks_the_link(monkeypatch):
+    monkeypatch.setattr(device.link, "ddi_mounted", lambda: True)
     assert device.ddi_mounted()
+    monkeypatch.setattr(device.link, "ddi_mounted", lambda: False)
+    assert not device.ddi_mounted()
 
 
-def test_ddi_mounted_false_on_none(monkeypatch):
-    out = '{"level":"INFO","msg":"none"}\n'
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+def test_ddi_mounted_false_when_phone_unreachable(monkeypatch):
+    def unreachable():
+        raise device.link.LinkError("no tunnel to the phone")
+
+    monkeypatch.setattr(device.link, "ddi_mounted", unreachable)
     assert not device.ddi_mounted()
 
 
 def test_mount_ddi_names_locked_phone(monkeypatch):
     # The one mount failure a human can fix on the spot must be named, not
     # buried in a log tail: DeviceLocked -> "unlock it".
-    out = '{"level":"ERROR","msg":"error mounting image","err":"map[Error:DeviceLocked]"}\n'
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+    def locked():
+        raise device.link.LinkError("PyMobileDevice3Exception: {'Error': 'DeviceLocked'}")
+
+    monkeypatch.setattr(device.link, "mount_ddi", locked)
     monkeypatch.setattr(device, "ddi_mounted", lambda: False)
     ok, msg = device.mount_ddi()
     assert not ok
@@ -120,7 +122,7 @@ def test_mount_ddi_names_locked_phone(monkeypatch):
 
 
 def test_mount_ddi_verifies_by_reprobe(monkeypatch):
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(""))
+    monkeypatch.setattr(device.link, "mount_ddi", lambda: None)
     monkeypatch.setattr(device, "ddi_mounted", lambda: True)
     ok, msg = device.mount_ddi()
     assert ok
@@ -148,17 +150,13 @@ def test_wda_bundle_no_cache_fallback_when_app_really_absent(monkeypatch, tmp_pa
 
 
 def _ios_apps_proc(bundle_ids):
-    lines = "\n".join(
-        f'{{"CFBundleIdentifier":"{bid}","CFBundleName":"{bid}"}}' for bid in bundle_ids
-    )
-    return _Proc(lines)
+    """Stand-in for link.list_apps returning these bundle ids."""
+    return lambda: [{"bundle_id": bid, "name": bid} for bid in bundle_ids]
 
 
 def test_list_apps_caches_nonempty_result_to_disk(monkeypatch, tmp_path):
     monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
-    monkeypatch.setattr(
-        device, "_run", lambda args, timeout=30.0: _ios_apps_proc(["com.a.App"])
-    )
+    monkeypatch.setattr(device.link, "list_apps", _ios_apps_proc(["com.a.App"]))
     apps = device.list_apps()
     assert apps == [{"bundle_id": "com.a.App", "name": "com.a.App"}]
     cached = json.loads((tmp_path / "apps_cache.json").read_text(encoding="utf-8"))
@@ -173,13 +171,13 @@ def test_list_apps_falls_back_to_cache_when_live_list_empty(monkeypatch, tmp_pat
     (tmp_path / "apps_cache.json").write_text(
         json.dumps([{"bundle_id": "com.a.App", "name": "com.a.App"}]), encoding="utf-8"
     )
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _ios_apps_proc([]))
+    monkeypatch.setattr(device.link, "list_apps", _ios_apps_proc([]))
     assert device.list_apps() == [{"bundle_id": "com.a.App", "name": "com.a.App"}]
 
 
 def test_list_apps_empty_with_no_cache_returns_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
-    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _ios_apps_proc([]))
+    monkeypatch.setattr(device.link, "list_apps", _ios_apps_proc([]))
     assert device.list_apps() == []
 
 
@@ -190,9 +188,7 @@ def test_list_apps_fresh_nonempty_overwrites_stale_cache(monkeypatch, tmp_path):
         json.dumps([{"bundle_id": "com.old.App", "name": "com.old.App"}]),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        device, "_run", lambda args, timeout=30.0: _ios_apps_proc(["com.new.App"])
-    )
+    monkeypatch.setattr(device.link, "list_apps", _ios_apps_proc(["com.new.App"]))
     assert device.list_apps() == [{"bundle_id": "com.new.App", "name": "com.new.App"}]
     cached = json.loads((tmp_path / "apps_cache.json").read_text(encoding="utf-8"))
     assert cached == [{"bundle_id": "com.new.App", "name": "com.new.App"}]
@@ -207,11 +203,11 @@ def test_list_devices_memoized_within_one_run(monkeypatch, tmp_path):
     monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
     calls = []
 
-    def fake_run(args, timeout=30.0):
-        calls.append(args)
-        return _Proc('{"deviceList":["00008150-X"]}')
+    def fake_list():
+        calls.append("list")
+        return ["00008150-X"]
 
-    monkeypatch.setattr(device, "_run", fake_run)
+    monkeypatch.setattr(device.link, "list_devices", fake_list)
     with device.memoized_run():
         assert device.list_devices() == ["00008150-X"]
         assert device.list_devices() == ["00008150-X"]
@@ -224,11 +220,11 @@ def test_list_apps_memoized_within_one_run(monkeypatch, tmp_path):
     monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
     calls = []
 
-    def fake_run(args, timeout=30.0):
-        calls.append(args)
-        return _ios_apps_proc(["com.a.App"])
+    def fake_apps():
+        calls.append("apps")
+        return [{"bundle_id": "com.a.App", "name": "com.a.App"}]
 
-    monkeypatch.setattr(device, "_run", fake_run)
+    monkeypatch.setattr(device.link, "list_apps", fake_apps)
     with device.memoized_run():
         device.list_apps()
         device.list_apps()
@@ -271,12 +267,12 @@ def test_memoized_run_thread_isolated(monkeypatch, tmp_path):
     calls = []
     lock = threading.Lock()
 
-    def fake_run(args, timeout=30.0):
+    def fake_list():
         with lock:
-            calls.append(args)
-        return _Proc('{"deviceList":["00008150-X"]}')
+            calls.append("list")
+        return ["00008150-X"]
 
-    monkeypatch.setattr(device, "_run", fake_run)
+    monkeypatch.setattr(device.link, "list_devices", fake_list)
 
     a_cached = threading.Event()
     b_cached = threading.Event()
@@ -336,78 +332,55 @@ def test_safe_kill_can_spare_the_process_tree(monkeypatch):
     assert "/T" in cmds[1][0]
 
 
-# ---- start_tunnel readiness poll -------------------------------------------
-# Pins that start_tunnel returns as soon as `tunnel ls` confirms the tunnel,
-# that its worst case is still the 3s sleep it replaced (probe timeouts
-# included — tunnel_running's own 10s would otherwise leak straight through
-# the cap), and that the wintun.dll fix line still prints when it dies.
+# ---- start_tunnel: tunneld runs as its own admin task; start_tunnel starts
+# that task only when tunneld is not answering, then waits for a tunnel, and
+# names which of the two is missing when it gives up.
 
 
-def _tunnel_env(monkeypatch, listed_on_call, status="running"):
+def _tunnel_env(monkeypatch, listed_on_call, tunneld_up=True):
     clock = [0.0]
-    sleeps = []
     probes = []
+    started = []
     monkeypatch.setattr(device.time, "monotonic", lambda: clock[0])
-
-    def fake_sleep(s):
-        sleeps.append(s)
-        clock[0] += s
-
-    monkeypatch.setattr(device.time, "sleep", fake_sleep)
-    monkeypatch.setattr(device, "_spawn", lambda n, a: 1234)
+    monkeypatch.setattr(device.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(device.link, "tunneld_up", lambda timeout=3.0: tunneld_up)
+    monkeypatch.setattr(
+        device.subprocess, "run", lambda cmd, **kw: started.append(cmd) or _Proc("")
+    )
 
     def fake_running(timeout=10.0):
-        probes.append((timeout, clock[0]))
-        clock[0] += 0.21  # the measured go-ios process spawn floor
+        probes.append(clock[0])
         return len(probes) >= listed_on_call
 
     monkeypatch.setattr(device, "tunnel_running", fake_running)
-    monkeypatch.setattr(device, "proc_status", lambda n: status)
-    return clock, sleeps, probes
+    return clock, probes, started
 
 
-def test_start_tunnel_returns_as_soon_as_the_tunnel_is_listed(monkeypatch):
-    # The 3s this replaced sits in front of DDI mount, WDA launch and the WDA
-    # poll on every cold bring-up, every Restart-link click and every
-    # deep-sleep self-heal — the moments the header reads "Starting link…".
-    clock, sleeps, probes = _tunnel_env(monkeypatch, listed_on_call=2)
+def test_start_tunnel_returns_as_soon_as_a_tunnel_is_listed(monkeypatch):
+    clock, probes, started = _tunnel_env(monkeypatch, listed_on_call=2)
     assert device.start_tunnel() is None
-    assert clock[0] < device._TUNNEL_READY_TIMEOUT
     assert len(probes) == 2
-    assert sleeps == [0.5]  # slept once per FAILED probe, not a flat 3s
+    assert clock[0] < device._TUNNEL_READY_TIMEOUT
+    assert started == []  # tunneld was up: its task is not touched
 
 
-def test_start_tunnel_still_raises_when_the_process_died(monkeypatch):
-    clock, _sleeps, _probes = _tunnel_env(
-        monkeypatch, listed_on_call=10_000, status="dead"
-    )
+def test_start_tunnel_starts_the_tunneld_task_when_tunneld_is_down(monkeypatch):
+    _clock, _probes, started = _tunnel_env(monkeypatch, listed_on_call=1, tunneld_up=False)
+    device.start_tunnel()
+    assert started and started[0][:3] == ["schtasks", "/Run", "/TN"]
+    assert started[0][3] == device.config.TUNNELD_TASK
+
+
+def test_start_tunnel_names_tunneld_when_it_never_comes_up(monkeypatch):
+    _tunnel_env(monkeypatch, listed_on_call=10_000, tunneld_up=False)
     with pytest.raises(device.DeviceError) as exc:
         device.start_tunnel()
-    assert "wintun" in str(exc.value)  # the fix line this function exists for
-    assert clock[0] >= 3.0  # waited exactly as long as the old sleep did
+    assert "tunneld is not running" in str(exc.value)
 
 
-def test_start_tunnel_falls_through_when_alive_but_unlisted(monkeypatch):
-    # Today's behaviour when `tunnel ls` never confirms but the process lives:
-    # return quietly and let ddi_mounted() be the one to complain.
-    _clock, _sleeps, _probes = _tunnel_env(monkeypatch, listed_on_call=10_000)
-    assert device.start_tunnel() is None
-
-
-def test_start_tunnel_never_probes_past_its_cap(monkeypatch):
-    # tunnel_running() runs `tunnel ls` on a 10s subprocess timeout, so a probe
-    # started at t=2.9s against a half-up daemon could run to 12.9s and blow the
-    # cap wide open. Each probe gets only the budget that is left.
-    clock, _sleeps, probes = _tunnel_env(monkeypatch, listed_on_call=10_000)
-    device.start_tunnel()
-    for timeout, started in probes:
-        assert timeout <= device._TUNNEL_READY_TIMEOUT
-        assert timeout <= device._TUNNEL_READY_TIMEOUT - started + 1e-9
-    assert clock[0] <= device._TUNNEL_READY_TIMEOUT + 0.25
-
-
-def test_tunnel_ready_cap_equals_the_sleep_it_replaced():
-    # Unmeasured on device: nobody has timed how long a userspace tunnel really
-    # takes to list. Until someone does, the cap stays at the old flat sleep so
-    # the worst case is unchanged and a bad result is a one-line revert.
-    assert device._TUNNEL_READY_TIMEOUT == 3.0
+def test_start_tunnel_names_the_phone_when_tunneld_has_no_tunnel(monkeypatch):
+    clock, _probes, _started = _tunnel_env(monkeypatch, listed_on_call=10_000)
+    with pytest.raises(device.DeviceError) as exc:
+        device.start_tunnel()
+    assert "no tunnel to the phone" in str(exc.value)
+    assert clock[0] >= device._TUNNEL_READY_TIMEOUT

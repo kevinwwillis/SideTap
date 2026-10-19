@@ -293,21 +293,17 @@ def test_doctor_results_memoizes_ios_list_within_one_pass(monkeypatch, tmp_path)
     monkeypatch.setattr(admin.device.config, "WDA_BUNDLE_ID", "")
     calls = {"list": 0, "apps": 0}
 
-    # timeout is unused but must keep this name: device._run is called with it
-    # as a keyword, so a rename would break the stand-in.
-    def fake_run(args, timeout=30.0):  # noqa: vulture
-        if args[0] == "list":
-            calls["list"] += 1
-            return _FakeProc('{"deviceList":["X"]}')
-        if args[:2] == ["apps", "--list"]:
-            calls["apps"] += 1
-            return _FakeProc(
-                '{"CFBundleIdentifier":"com.x.WebDriverAgentRunner.xctrunner",'
-                '"CFBundleName":"WDA"}'
-            )
-        return _FakeProc("")
+    def fake_list():
+        calls["list"] += 1
+        return ["X"]
 
-    monkeypatch.setattr(admin.device, "_run", fake_run)
+    def fake_apps():
+        calls["apps"] += 1
+        return [{"bundle_id": "com.x.WebDriverAgentRunner.xctrunner", "name": "WDA"}]
+
+    monkeypatch.setattr(admin.device.link, "list_devices", fake_list)
+    monkeypatch.setattr(admin.device.link, "list_apps", fake_apps)
+    monkeypatch.setattr(admin.device.link, "tunnel_for", lambda udid=None: ("fd00::1", 1, "usb"))
     # CHECKS entries are bound to function objects at import time, so
     # monkeypatching admin._check_x doesn't affect them — isolate the two
     # subprocess-backed checks under test rather than faking every other

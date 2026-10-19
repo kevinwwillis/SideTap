@@ -118,8 +118,11 @@ def start() -> bool:
     if now < _next_attempt:
         return False
     _next_attempt = now + _RETRY_SECONDS
-    exe = device.ios_path()
-    if not exe:
+    try:
+        udid = device.current_udid()
+    except Exception:
+        udid = None
+    if not udid:
         return False
     # A viewer killed with taskkill /F leaves its `ios syslog` child orphaned,
     # blocked forever on a pipe nobody reads but still holding a syslog relay
@@ -130,7 +133,7 @@ def start() -> bool:
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         proc = subprocess.Popen(
-            [exe, *device.pin_udid(["syslog"])],
+            [sys.executable, "-m", "pymobiledevice3", "syslog", "live", "--tunnel", udid],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

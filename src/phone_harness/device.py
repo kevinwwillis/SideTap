@@ -1,7 +1,10 @@
-"""go-ios wrapper: device discovery, tunnel, WDA launch, port forwards.
+"""Device layer: discovery, WDA launch, the loopback relay, app control.
 
-Long-running processes (tunnel, runwda, forwards) are started detached with
-their pids and logs kept in .state/ so `up` and `down` can manage them.
+Talks to the phone through pymobiledevice3 and tunneld (link.py), over USB or
+Wi-Fi alike; go-ios is kept only for `ios sign app` (fix-input). Long-running
+processes (runwda, relay) are started detached with their pids and logs kept
+in .state/ so `up` and `down` can manage them. tunneld is not one of them: it
+needs admin rights and runs as its own logon task (config.TUNNELD_TASK).
 """
 
 from __future__ import annotations
@@ -16,14 +19,17 @@ import threading
 import time
 from pathlib import Path
 
-from . import config
+from . import config, link
 
 
 class DeviceError(RuntimeError):
     pass
 
 
-PROCS = ("tunnel", "runwda", "forward8100", "forward9100", "syslog")
+PROCS = ("runwda", "relay", "syslog")
+# Pid files the go-ios versions wrote (`ios tunnel`, `ios forward`); stop_all
+# still clears them so an upgrade leaves no orphaned 0.0.0.0 forwarder behind.
+LEGACY_PROCS = ("tunnel", "forward8100", "forward9100")
 
 # Every go-ios child inherits this, so the tunnel server and every client that
 # looks it up (`tunnel ls`, runwda, image, screenshot, syslog) agree on one
@@ -123,17 +129,20 @@ def _json_lines(text: str) -> list[dict]:
     return out
 
 
+def _link(fn, *args):
+    """Call a link.py function, reporting its failures as DeviceError."""
+    try:
+        return fn(*args)
+    except link.LinkError as exc:
+        raise DeviceError(str(exc)) from exc
+
+
 def list_devices() -> list[str]:
-    """UDIDs of USB-connected iPhones."""
+    """UDIDs of phones with a live tunnel (USB or Wi-Fi)."""
     cache = getattr(_run_cache, "cache", None)
     if cache is not None and "list_devices" in cache:
         return cache["list_devices"]
-    proc = _run(["list"])
-    result = []
-    for obj in _json_lines(proc.stdout + proc.stderr):
-        if "deviceList" in obj:
-            result = list(obj["deviceList"])
-            break
+    result = _link(link.list_devices)
     if cache is not None:
         cache["list_devices"] = result
     return result
@@ -154,28 +163,10 @@ def list_apps() -> list[dict]:
     cache = getattr(_run_cache, "cache", None)
     if cache is not None and "list_apps" in cache:
         return cache["list_apps"]
-    proc = _run(["apps", "--list"], timeout=15)
-    apps = []
-    for obj in _json_lines(proc.stdout):
-        # newer go-ios: JSON objects with CFBundleIdentifier / CFBundleName
-        bid = (
-            obj.get("CFBundleIdentifier") or obj.get("bundleId") or obj.get("bundle_id")
-        )
-        if bid:
-            apps.append(
-                {
-                    "bundle_id": bid,
-                    "name": obj.get("CFBundleName") or obj.get("name", ""),
-                }
-            )
-    if not apps:
-        # fallback: plain "bundleid name" lines
-        for line in proc.stdout.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) >= 1 and "." in parts[0]:
-                apps.append(
-                    {"bundle_id": parts[0], "name": parts[1] if len(parts) > 1 else ""}
-                )
+    try:
+        apps = _link(link.list_apps)
+    except DeviceError:
+        apps = []  # unreachable reads like the deep-sleep empty list: use the cache
     if apps:
         try:
             config.STATE_DIR.mkdir(exist_ok=True)
@@ -205,25 +196,15 @@ def running_apps() -> list[dict]:  # noqa: vulture  (called from helpers.py)
     Settings, while the top and left edge gestures work), so the switcher
     screen itself cannot be opened and this stands in for it.
     """
-    proc = _run(["ps"], timeout=15)
-    apps = [
-        {
-            "name": str(obj.get("Name", "")),
-            "pid": obj.get("Pid"),
-            "started": str(obj.get("StartDate", "")),
-        }
-        for obj in _json_lines(proc.stdout)
-        if obj.get("IsApplication")
-    ]
+    apps = _link(link.running_apps)
     apps.sort(key=lambda a: a["started"], reverse=True)
     return apps
 
 
 def kill_app(bundle_id: str) -> bool:  # noqa: vulture  (called from helpers.py)
-    """Force-quit an app by bundle id (`ios kill`): the switcher's swipe-up.
-    False when go-ios reports nothing to kill (already gone)."""
-    proc = _run(["kill", bundle_id], timeout=15)
-    return proc.returncode == 0
+    """Force-quit an app by bundle id: the switcher's swipe-up.
+    False when it is not running (already gone)."""
+    return bool(_link(link.kill_app, bundle_id))
 
 
 def _wda_cache_file() -> Path:
@@ -266,10 +247,7 @@ def lockdown_ready() -> bool:  # noqa: vulture
     """Can we talk lockdown right now? Deep sleep gates it (ReadPair errors,
     exit 1) while tunnel services like screenshot keep working — so this is
     the cheap "has the human woken the phone yet" probe."""
-    try:
-        return _run(["date"], timeout=10).returncode == 0
-    except (DeviceError, subprocess.TimeoutExpired):
-        return False
+    return link.device_answers()
 
 
 def tunnel_running(timeout: float = 10.0) -> bool:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)
@@ -278,17 +256,11 @@ def tunnel_running(timeout: float = 10.0) -> bool:  # noqa: vulture  (called fro
     the cap would run to its own 10s and stretch the cap to 12.9s. Every other
     caller keeps the 10s it always had."""
     try:
-        proc = _run(["tunnel", "ls"], timeout=timeout)
-    except (DeviceError, subprocess.TimeoutExpired):
+        link.tunnels(timeout=max(0.1, min(timeout, 3.0)))
+        link.tunnel_for()
+    except link.LinkError:
         return False
-    for obj in _json_lines(proc.stdout + proc.stderr):
-        # skip go-ios log lines ({"level": ..., "msg": ...}); a real tunnel
-        # entry carries an address + RSD port
-        if obj.get("level"):
-            continue
-        if obj.get("address") and obj.get("rsdPort"):
-            return True
-    return False
+    return True
 
 
 def ddi_mounted() -> bool:
@@ -298,30 +270,28 @@ def ddi_mounted() -> bool:
     2026-08-10, the 26.5→26.6 update). Mounted: `image list` prints a line with
     a "signature" key; unmounted: msg "none"."""
     try:
-        proc = _run(["image", "list"], timeout=15)
-    except (DeviceError, subprocess.TimeoutExpired):
+        return bool(link.ddi_mounted())
+    except link.LinkError:
         return False
-    if proc.returncode != 0:
-        return False
-    return any(obj.get("signature") for obj in _json_lines(proc.stdout + proc.stderr))
 
 
 def mount_ddi() -> tuple[bool, str]:  # noqa: vulture  (called from admin.py)
-    """Mount the developer image (`ios image auto`). The phone must be UNLOCKED
+    """Mount the personalized developer image. The phone must be UNLOCKED
     (iOS answers DeviceLocked otherwise); the first mount after an iOS update
-    also needs internet (Apple TSS signs the image). Success is verified by
-    re-probing, not by parsing the mount log."""
+    also needs internet (Apple TSS signs the image). pymobiledevice3, not
+    `ios image auto`: go-ios's TSS request fails on Windows because Apple's
+    signing server chains to a root Windows does not ship. Success is verified
+    by re-probing, not by parsing the mount log."""
     try:
-        proc = _run(["image", "auto"], timeout=180)
-    except (DeviceError, subprocess.TimeoutExpired) as exc:
-        return False, f"`ios image auto` failed: {exc}"
+        link.mount_ddi()
+        err = ""
+    except link.LinkError as exc:
+        err = str(exc)
     if ddi_mounted():
         return True, "developer image mounted"
-    out = proc.stdout + proc.stderr
-    if "DeviceLocked" in out:
+    if "DeviceLocked" in err:
         return False, "phone is locked — unlock it, then retry"
-    tail = out.strip().splitlines()[-1] if out.strip() else "no output"
-    return False, f"`ios image auto` did not mount: {tail}"
+    return False, f"developer image did not mount: {err or 'no error reported'}"
 
 
 # ---- detached process management ------------------------------------------
@@ -350,6 +320,35 @@ def _spawn(name: str, args: list[str]) -> int:
         stdout=log,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    _pid_file(name).write_text(str(proc.pid), encoding="utf-8")
+    return proc.pid
+
+
+def _pythonw() -> str:
+    """The windowless interpreter next to this one (no console flash on Windows)."""
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    return str(windowless if sys.platform == "win32" and windowless.is_file() else exe)
+
+
+def _spawn_py(name: str, args: list[str]) -> int:
+    """Start `pythonw <args>` detached with this package importable; pid + log in .state/."""
+    config.STATE_DIR.mkdir(exist_ok=True)
+    log = open(_log_file(name), "w", encoding="utf-8")
+    env = dict(os.environ)
+    src = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(
+        [_pythonw(), *args],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        env=env,
         creationflags=flags,
     )
     _pid_file(name).write_text(str(proc.pid), encoding="utf-8")
@@ -447,9 +446,12 @@ def stop_all(names: tuple[str, ...] = PROCS) -> list[str]:  # noqa: vulture  (ca
     orphaned capture without taking the phone link down with it.
     """
     exe = ios_path()
-    expected = Path(exe).name.lower() if exe else "ios"
+    legacy = Path(exe).name.lower() if exe else "ios"
     stopped = []
+    if names is PROCS:
+        names = (*PROCS, *LEGACY_PROCS)
     for name in names:
+        expected = legacy if name in LEGACY_PROCS else "python"
         pf = _pid_file(name)
         if not pf.exists():
             continue
@@ -472,51 +474,60 @@ def stop_all(names: tuple[str, ...] = PROCS) -> list[str]:  # noqa: vulture  (ca
 # does not touch the phone), but it is still a ~207ms process spawn, so the
 # interval stays coarse. The cap EQUALS the sleep it replaced, so the worst
 # case is unchanged and a bad result is a one-line revert.
-_TUNNEL_READY_TIMEOUT = (
-    3.0  # needs device check: how long a userspace tunnel really takes
-)
+# tunneld found the phone over Wi-Fi within 5 s of the link appearing (measured
+# 2026-10-18); a fresh start of tunneld itself adds its own start-up.
+_TUNNEL_READY_TIMEOUT = 20.0
 _TUNNEL_READY_POLL = 0.5
 
 
 def start_tunnel() -> None:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)
-    """Start the iOS 17+ tunnel. Tries userspace mode first (no admin needed).
+    """Make sure tunneld runs and has a tunnel to the phone.
 
-    Returns as soon as `tunnel ls` reports an entry with an address AND an
-    rsdPort — the same signal _up() already trusts to skip starting a tunnel at
-    all, and the RSD handshake the very next step (`ios image list`) dials.
-    Never returns early on "the process is still alive": that would hand a
-    half-established tunnel to ddi_mounted() and turn into a spurious
-    "developer image not mounted".
+    tunneld creates TUN interfaces, so it needs admin rights and runs as its own
+    logon task; this starts that task if tunneld is not answering, then waits
+    for a tunnel. USB or Wi-Fi: tunneld picks whichever link the phone is on.
     """
-    _spawn("tunnel", ["tunnel", "start", "--userspace"])
-    deadline = time.monotonic() + _TUNNEL_READY_TIMEOUT
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            break
-        # Each probe gets only the budget that is left, so one hung
-        # `tunnel ls` cannot stretch the 3.0s cap to its own 10s timeout.
-        if tunnel_running(timeout=left):
-            return
-        time.sleep(min(_TUNNEL_READY_POLL, max(0.0, deadline - time.monotonic())))
-    if proc_status("tunnel") == "dead":
-        raise DeviceError(
-            "Tunnel failed to start. Log tail:\n" + log_tail("tunnel") + "\n"
-            "Fix: run `$env:GO_IOS_AGENT_PORT="
-            f"{config.GO_IOS_AGENT_PORT}; ios tunnel start` in an **admin** PowerShell "
-            "(needs wintun.dll in C:\\Windows\\System32, from https://www.wintun.net), "
-            "keep it open, then retry."
+    if not link.tunneld_up():
+        task = config.TUNNELD_TASK
+        subprocess.run(
+            ["schtasks", "/Run", "/TN", task],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
+    deadline = time.monotonic() + _TUNNEL_READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if tunnel_running():
+            return
+        time.sleep(_TUNNEL_READY_POLL)
+    if not link.tunneld_up():
+        raise DeviceError(
+            f"tunneld is not running and the '{config.TUNNELD_TASK}' task did not start it. "
+            "Run it from an admin shell: python -m pymobiledevice3 remote tunneld"
+        )
+    raise DeviceError(
+        "tunneld is running but has no tunnel to the phone: plug it in by USB, or "
+        "put it on the same Wi-Fi as this PC, and wake it."
+    )
 
 
 def start_wda(bundle_id: str) -> None:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)
-    _spawn(
+    """Start WebDriverAgent through the current tunnel, listening on it only.
+
+    USE_IP binds WDA's HTTP and MJPEG servers to the device's tunnel address;
+    without it WDA listens on every interface and anyone on the home Wi-Fi can
+    drive the phone (no authentication). A runner left from an earlier tunnel
+    is killed first, or the new one dies with XCTest error 103.
+    """
+    address, port, _ = _link(link.tunnel_for)
+    with contextlib.suppress(link.LinkError):
+        link.kill_app(bundle_id)
+    _spawn_py(
         "runwda",
         [
-            "runwda",
-            f"--bundleid={bundle_id}",
-            f"--testrunnerbundleid={bundle_id}",
-            "--xctestconfig=WebDriverAgentRunner.xctest",
+            "-m", "pymobiledevice3", "developer", "dvt", "xcuitest", bundle_id,
+            "--rsd", address, str(port),
+            "--env", f"USE_IP={address}",
         ],
     )
 
@@ -533,12 +544,9 @@ def foreground_springboard() -> bool:  # noqa: vulture  (called from admin.py)
     Foregrounding another app releases the AX wait: measured 2026-08-17 against
     TikTok's For You feed, WDA answered again ~20s later, no restart needed.
     """
-    ios = ios_path()
-    if not ios:
-        return False
     try:
-        return _run(["launch", "com.apple.springboard"], timeout=20).returncode == 0
-    except (OSError, subprocess.SubprocessError, DeviceError):
+        return bool(link.launch("com.apple.springboard"))
+    except link.LinkError:
         return False
 
 
@@ -661,10 +669,16 @@ def lan_block_rule_active(rule_name: str = "phone-harness block LAN") -> bool:  
 
 
 def start_forwards() -> None:  # noqa: vulture  (called from admin.py/viewer.py, outside this commit)
+    """Start the loopback relay (relay.py) unless it already runs.
+
+    It follows the tunnel on its own, so a replug or a Wi-Fi reconnect needs no
+    restart of the relay. Leftover go-ios forwarders on the same ports are
+    cleared first."""
+    if proc_status("relay") == "running":
+        return
     _free_port(config.WDA_PORT)
     _free_port(config.MJPEG_PORT)
-    _spawn("forward8100", ["forward", str(config.WDA_PORT), "8100"])
-    _spawn("forward9100", ["forward", str(config.MJPEG_PORT), "9100"])
+    _spawn_py("relay", ["-m", "phone_harness.relay"])
 
 
 def current_udid() -> str | None:  # noqa: vulture  (used by signing.py)
