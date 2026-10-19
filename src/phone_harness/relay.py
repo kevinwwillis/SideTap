@@ -7,6 +7,10 @@ talks to http://127.0.0.1:8100, so this relay looks the tunnel up per new
 connection and pipes bytes both ways. It listens on loopback only: unlike
 `ios forward` (0.0.0.0, needing a firewall block), nothing here faces the LAN.
 
+It also stops WDA after config.WDA_IDLE_STOP_MINUTES with no traffic, because
+iOS shows its "Automation Running" banner for as long as WDA runs; the next
+call finds WDA stopped and the self-heal starts it again.
+
 Run detached by device.start_forwards(): `pythonw -m phone_harness.relay`.
 """
 
@@ -14,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 
 from . import config, link
@@ -36,9 +41,20 @@ def _tunnel_address() -> str:
     return address
 
 
+_last_traffic = time.monotonic()  # bytes through either port, or a new connection
+_open: set[asyncio.StreamWriter] = set()  # both ends of every piped connection
+_gate: asyncio.Event | None = None  # set while an idle stop runs; new connections wait
+
+
+def _touch() -> None:
+    global _last_traffic
+    _last_traffic = time.monotonic()
+
+
 async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         while data := await reader.read(65536):
+            _touch()
             writer.write(data)
             await writer.drain()
     except (ConnectionError, OSError, asyncio.CancelledError):
@@ -88,6 +104,9 @@ async def _answer_unreachable(
 _HEAL_COOLDOWN = 30.0  # seconds between two self-heal attempts
 _heal_started = 0.0
 _healing = False
+# Held while WDA is being started or stopped, so an idle stop can never kill
+# the runner a self-heal has just started.
+_lifecycle = threading.Lock()
 
 
 def _heal() -> None:
@@ -103,7 +122,8 @@ def _heal() -> None:
     try:
         from . import admin
 
-        admin.up()
+        with _lifecycle:
+            admin.up()
     except Exception as exc:  # the relay must outlive a failed repair
         print(f"self-heal failed: {exc}", flush=True)
     finally:
@@ -123,6 +143,9 @@ def _maybe_heal() -> None:
 def _handler(device_port: int):
     async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
         global _cached, _last_failure
+        _touch()
+        while (gate := _gate) is not None:
+            await gate.wait()
         try:
             address = await asyncio.to_thread(_tunnel_address)
             dev_r, dev_w = await asyncio.wait_for(
@@ -145,9 +168,66 @@ def _handler(device_port: int):
                 _maybe_heal()
             return
         _last_failure = ""
-        await asyncio.gather(_pipe(client_r, dev_w), _pipe(dev_r, client_w))
+        pair = {client_w, dev_w}
+        _open.update(pair)
+        try:
+            await asyncio.gather(_pipe(client_r, dev_w), _pipe(dev_r, client_w))
+        finally:
+            _open.difference_update(pair)
 
     return handle
+
+
+_IDLE_CHECK = 30.0  # seconds between two idle checks
+
+
+def _idle_stop(idle_seconds: float) -> bool:
+    """Stop WDA if nothing has gone through the relay for `idle_seconds`.
+
+    Idle means no bytes and no new connection on either port. Open but silent
+    connections do not count: an agent's HTTP client keeps one pooled for
+    good, while a live MJPEG stream sends bytes all the time."""
+    from . import device
+
+    with _lifecycle, device.wda_lifecycle_lock():
+        if _healing or time.monotonic() - _last_traffic < idle_seconds:
+            return False
+        if device.proc_status("runwda") != "running":
+            return False
+        age = device.proc_age("runwda")
+        if age is not None and age < idle_seconds:
+            return False  # started from outside the relay (`up`, the viewer) just now
+        device.stop_all(("runwda",))
+        device.mark_wda_idle()
+    print(f"{time.ctime()} WDA idle for {idle_seconds / 60:g} min; stopped it", flush=True)
+    return True
+
+
+async def _idle_watch(idle_seconds: float) -> None:
+    while True:
+        await asyncio.sleep(_IDLE_CHECK)
+        await _idle_check(idle_seconds)
+
+
+async def _idle_check(idle_seconds: float) -> None:
+    """Decide on the event loop, where every byte is piped, so nothing can be
+    forwarded between "idle" and the gate closing: a request that reached WDA
+    must never meet a WDA being killed under it (it could not be replayed).
+    Open connections are silent ones (pooled by HTTP clients); they are closed
+    so a client opens a fresh one, which waits at the gate and then starts WDA."""
+    global _gate
+    if _gate is not None or _healing or time.monotonic() - _last_traffic < idle_seconds:
+        return
+    _gate = asyncio.Event()
+    for writer in list(_open):
+        writer.close()
+    try:
+        await asyncio.to_thread(_idle_stop, idle_seconds)
+    except Exception as exc:  # the relay must outlive a failed stop
+        print(f"{time.ctime()} idle stop failed: {exc}", flush=True)
+    finally:
+        _gate.set()
+        _gate = None
 
 
 async def serve() -> None:
@@ -155,7 +235,10 @@ async def serve() -> None:
         await asyncio.start_server(_handler(DEVICE_WDA_PORT), "127.0.0.1", config.WDA_PORT),
         await asyncio.start_server(_handler(DEVICE_MJPEG_PORT), "127.0.0.1", config.MJPEG_PORT),
     ]
-    await asyncio.gather(*(s.serve_forever() for s in servers))
+    tasks = [s.serve_forever() for s in servers]
+    if config.WDA_IDLE_STOP_MINUTES > 0:
+        tasks.append(_idle_watch(config.WDA_IDLE_STOP_MINUTES * 60))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

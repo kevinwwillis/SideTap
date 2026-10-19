@@ -314,6 +314,65 @@ def _log_file(name: str) -> Path:
     return config.STATE_DIR / f"{name}.log"
 
 
+def _idle_file() -> Path:
+    return config.STATE_DIR / "wda-idle"
+
+
+def mark_wda_idle() -> None:
+    """Record that the relay stopped WDA for being idle, not because it died."""
+    _idle_file().write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+
+
+@contextlib.contextmanager
+def wda_lifecycle_lock():
+    """Held, across processes, while WDA is started or idle-stopped.
+
+    The relay idle-stops WDA from its own process; without this a manual
+    `phone-harness up` or the viewer could start a runner between the relay's
+    "still idle?" check and its kill, and the relay would kill the new one."""
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(config.STATE_DIR / "wda-lifecycle.lock", "a+b") as f:
+        if sys.platform == "win32":
+            import msvcrt
+
+            f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def proc_age(name: str) -> float | None:
+    """Seconds since the process was started (its pid file written), or None."""
+    try:
+        return time.time() - _pid_file(name).stat().st_mtime
+    except OSError:
+        return None
+
+
+def wda_idle_since() -> str | None:
+    """When the relay idle-stopped WDA, or None when WDA was not idle-stopped."""
+    try:
+        return _idle_file().read_text(encoding="utf-8").strip() or "?"
+    except OSError:
+        return None
+
+
 def _spawn(name: str, args: list[str]) -> int:
     """Start `ios <args>` detached; record pid and send output to a log file."""
     exe = ios_path()
@@ -566,16 +625,18 @@ def start_wda(bundle_id: str) -> None:  # noqa: vulture  (called from admin.py/v
     is killed first, or the new one dies with XCTest error 103.
     """
     address, port, _ = _link(link.tunnel_for)
-    with contextlib.suppress(link.LinkError):
-        link.kill_app(bundle_id)
-    _spawn_py(
-        "runwda",
-        [
-            "-m", "pymobiledevice3", "developer", "dvt", "xcuitest", bundle_id,
-            "--rsd", address, str(port),
-            "--env", f"USE_IP={address}",
-        ],
-    )
+    with wda_lifecycle_lock():
+        with contextlib.suppress(link.LinkError):
+            link.kill_app(bundle_id)
+        _idle_file().unlink(missing_ok=True)
+        _spawn_py(
+            "runwda",
+            [
+                "-m", "pymobiledevice3", "developer", "dvt", "xcuitest", bundle_id,
+                "--rsd", address, str(port),
+                "--env", f"USE_IP={address}",
+            ],
+        )
 
 
 def foreground_springboard() -> bool:  # noqa: vulture  (called from admin.py)

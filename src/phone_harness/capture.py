@@ -57,17 +57,19 @@ def _device_screenshot() -> bytes:
         ) from exc
 
 
-def screenshot_png(max_age: float = 0.0) -> bytes:  # noqa: vulture  (called from viewer.py/mcp_server.py)
+def screenshot_png(max_age: float = 0.0, via_wda: bool = True) -> bytes:  # noqa: vulture  (called from viewer.py/mcp_server.py)
     """Return the current screen as PNG bytes.
 
     max_age > 0 returns a cached frame if it is younger than max_age seconds,
     which keeps the viewer smooth without hammering the device.
+    via_wda=False skips WDA: any connection to it starts an idle-stopped WDA
+    again (relay self-heal), and with it the "Automation Running" banner.
     """
     global _last_png, _last_at
     if max_age and _last_png is not None and (time.time() - _last_at) < max_age:
         return _last_png
 
-    png = _wda_screenshot()
+    png = _wda_screenshot() if via_wda else None
     if png is None:
         png = _device_screenshot()
 

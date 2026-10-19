@@ -124,9 +124,11 @@ def _check_wda_installed():
 
 
 def _check_perception():
-    """Screenshots via go-ios need no app signing. This is the 'seeing' half."""
+    """Screenshots from the developer image need no app signing and no WDA.
+    This is the 'seeing' half, so it must not go through WDA, and must not wake
+    an idle-stopped WDA."""
     try:
-        png = capture.screenshot_png()
+        png = capture.screenshot_png(via_wda=False)
     except Exception as exc:
         return (
             False,
@@ -138,6 +140,22 @@ def _check_perception():
 
 
 def _check_wda_responding():
+    idle_since = device.wda_idle_since()
+    if (
+        idle_since
+        and device.proc_status("runwda") != "running"
+        # Only the relay starts it again on the next call; without one this is
+        # plain "down" (for example after `phone-harness down`).
+        and device.proc_status("relay") == "running"
+    ):
+        # Probing would make the relay start it again (self-heal), and bring
+        # back the banner the idle stop exists to remove.
+        return (
+            True,
+            f"WDA stopped while idle since {idle_since} (no 'Automation Running' "
+            "banner); the next agent call starts it",
+            "",
+        )
     client = WDAClient(timeout=5)
     state = client.link_state()
     if state == "up":

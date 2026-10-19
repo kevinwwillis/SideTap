@@ -76,3 +76,11 @@ def test_unreachable_phone_and_no_wda_raises(fresh, monkeypatch):
     monkeypatch.setattr(capture.link, "screenshot_png", unreachable)
     with pytest.raises(capture.CaptureError, match="no tunnel to the phone"):
         capture.screenshot_png()
+
+
+def test_screenshot_can_skip_wda(fresh, monkeypatch):
+    """The doctor's capture check must not touch (and so wake) an idle-stopped WDA."""
+    stub = fresh(StubWDA())
+    monkeypatch.setattr(capture.link, "screenshot_png", lambda: b"device-frame")
+    assert capture.screenshot_png(via_wda=False) == b"device-frame"
+    assert stub.calls == 0
