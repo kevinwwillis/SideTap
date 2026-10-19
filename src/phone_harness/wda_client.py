@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import requests
+import urllib3
 
 from . import config
 
@@ -29,6 +30,35 @@ class WDATimeout(WDAError):
     gesture that timed out may still be landing on the phone, so a caller may
     never replay it. A WDAError subclass, so every existing handler still
     catches it."""
+
+
+class WDAUnreachable(WDAError):
+    """The request never reached WDA: the relay could not connect to it (its
+    marked 503) or nothing listened on the relay port. Replaying is safe for
+    any request, gestures included, because nothing acted."""
+
+
+# Set by relay.py on the 503 it sends when WDA is out of reach.
+UNREACHABLE_HEADER = "X-Phone-Relay"
+
+# Pause between two tries while the relay's self-heal brings WDA back.
+_RECONNECT_POLL = 1.0
+
+
+def _never_connected(exc: requests.RequestException) -> bool:
+    """True when the TCP connect itself failed (nothing listening), so no
+    request bytes left this PC."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (urllib3.exceptions.NewConnectionError, ConnectionRefusedError)):
+            return True
+        nxt = getattr(cur, "reason", None)
+        if nxt is None and cur.args and isinstance(cur.args[0], BaseException):
+            nxt = cur.args[0]
+        cur = nxt if isinstance(nxt, BaseException) else (cur.__cause__ or cur.__context__)
+    return False
 
 
 def stop_file():
@@ -247,9 +277,19 @@ def _append_activity(summary: str) -> None:
 
 
 class WDAClient:
-    def __init__(self, base_url: str = config.WDA_URL, timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = config.WDA_URL,
+        timeout: float = 30.0,
+        reconnect_wait: float = 0.0,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # Seconds a call keeps retrying while WDA is unreachable (WDAUnreachable),
+        # e.g. after a USB/Wi-Fi switch while the relay's self-heal restarts it
+        # (~10-30 s measured 2026-10-18). Agent-facing clients set it; health
+        # probes keep 0 so `up` and `doctor` see a down link at once.
+        self.reconnect_wait = reconnect_wait
         self.session_id: str | None = None
         # The id a gesture timed out on; the next gesture replaces it.
         self._suspect_session: str | None = None
@@ -269,11 +309,21 @@ class WDAClient:
         # Kill switch: every phone-changing call funnels through here as a POST.
         # GETs (perception) and session creation stay allowed so the viewer can
         # still show the screen while stopped.
-        if method == "POST" and path != "/session" and stop_engaged():
-            raise WDAError(
-                "STOP is engaged (.state/STOP exists). Click RESUME in the "
-                "viewer, or delete the file, to allow actions again."
-            )
+        deadline = time.monotonic() + self.reconnect_wait
+        while True:
+            if method == "POST" and path != "/session" and stop_engaged():
+                raise WDAError(
+                    "STOP is engaged (.state/STOP exists). Click RESUME in the "
+                    "viewer, or delete the file, to allow actions again."
+                )
+            try:
+                return self._request_once(method, path, payload)
+            except WDAUnreachable:
+                if time.monotonic() + _RECONNECT_POLL > deadline:
+                    raise
+                time.sleep(_RECONNECT_POLL)
+
+    def _request_once(self, method: str, path: str, payload: dict | None) -> Any:
         url = self.base_url + path
         try:
             resp = self._http.request(method, url, json=payload, timeout=self.timeout)
@@ -293,10 +343,17 @@ class WDAClient:
                 "in front, which releases WDA."
             ) from exc
         except requests.RequestException as exc:
-            raise WDAError(
+            kind = WDAUnreachable if _never_connected(exc) else WDAError
+            raise kind(
                 f"Cannot reach WebDriverAgent at {self.base_url}. "
                 "Run `phone-harness up` (and check `phone-harness doctor`)."
             ) from exc
+        if resp.headers.get(UNREACHABLE_HEADER) == "unreachable":
+            raise WDAUnreachable(
+                f"Cannot reach WebDriverAgent through the relay at {self.base_url} "
+                f"({resp.text[:200]}). The relay is restarting it; if this "
+                "persists, run `phone-harness up` (and check `phone-harness doctor`)."
+            )
         try:
             body = resp.json()
         except ValueError as exc:

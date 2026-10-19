@@ -13,6 +13,7 @@ Run detached by device.start_forwards(): `pythonw -m phone_harness.relay`.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from . import config, link
@@ -47,6 +48,41 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
             writer.close()
         except Exception:
             pass
+
+
+UNREACHABLE_HEADER = "X-Phone-Relay"  # value "unreachable"; read by wda_client
+
+
+async def _answer_unreachable(
+    client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter, reason: str
+) -> None:
+    """Answer an HTTP request that never reached WDA with a marked 503.
+
+    The request is read first (headers and any body), so closing afterwards
+    does not reset the connection under the reply. Never raises."""
+    try:
+        head = await asyncio.wait_for(client_r.readuntil(b"\r\n\r\n"), timeout=2)
+        length = 0
+        for line in head.split(b"\r\n"):
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                length = int(value.strip() or 0)
+        if length:
+            await asyncio.wait_for(client_r.readexactly(length), timeout=2)
+        body = json.dumps(
+            {"value": {"error": "wda unreachable", "message": f"relay: {reason}"}}
+        ).encode()
+        client_w.write(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            + f"{UNREACHABLE_HEADER}: unreachable\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await asyncio.wait_for(client_w.drain(), timeout=2)
+    except Exception:
+        pass  # a bare close still reads as "WDA not answering"
 
 
 _HEAL_COOLDOWN = 30.0  # seconds between two self-heal attempts
@@ -93,8 +129,12 @@ def _handler(device_port: int):
                 asyncio.open_connection(address, device_port), timeout=5
             )
         except (link.LinkError, OSError, asyncio.TimeoutError) as exc:
-            # Closing at once looks to the client like "WDA not answering",
-            # which is exactly what the callers already handle.
+            if device_port == DEVICE_WDA_PORT:
+                # Nothing was forwarded, so say so: the client may replay any
+                # request after this answer (wda_client.UNREACHABLE_HEADER),
+                # which it could not do after a bare close (a WDA dying
+                # mid-gesture looks the same).
+                await _answer_unreachable(client_r, client_w, f"{type(exc).__name__}: {exc}")
             client_w.close()
             _cached = None  # look the tunnel up afresh next time
             reason = f"{type(exc).__name__}: {exc}"

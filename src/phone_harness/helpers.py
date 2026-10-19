@@ -16,12 +16,14 @@ from . import approval, capture, config, device, trust
 from .wda_client import WDAClient, WDAError, activity_file, redact_actions
 
 _client: WDAClient | None = None
+# Agent calls ride out a USB/Wi-Fi switch while the relay restarts WDA.
+_RECONNECT_WAIT = 30.0
 
 
 def client() -> WDAClient:
     global _client
     if _client is None:
-        _client = WDAClient()
+        _client = WDAClient(reconnect_wait=_RECONNECT_WAIT)
     return _client
 
 
@@ -1786,7 +1788,9 @@ def unlock(c: WDAClient | None = None) -> None:
     # viewer's is 10s) aborts a swipe that is still going to land, so the
     # sequence runs on a patient clone sharing the same session.
     if isinstance(c, WDAClient) and c.timeout < _UNLOCK_TIMEOUT:
-        patient = WDAClient(base_url=c.base_url, timeout=_UNLOCK_TIMEOUT)
+        patient = WDAClient(
+            base_url=c.base_url, timeout=_UNLOCK_TIMEOUT, reconnect_wait=c.reconnect_wait
+        )
         patient.session_id = c.session_id
         c = patient
     try:
