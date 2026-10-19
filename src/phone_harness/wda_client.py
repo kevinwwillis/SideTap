@@ -47,18 +47,17 @@ _RECONNECT_POLL = 1.0
 
 def _never_connected(exc: requests.RequestException) -> bool:
     """True when the TCP connect itself failed (nothing listening), so no
-    request bytes left this PC."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, (urllib3.exceptions.NewConnectionError, ConnectionRefusedError)):
-            return True
-        nxt = getattr(cur, "reason", None)
-        if nxt is None and cur.args and isinstance(cur.args[0], BaseException):
-            nxt = cur.args[0]
-        cur = nxt if isinstance(nxt, BaseException) else (cur.__cause__ or cur.__context__)
-    return False
+    request bytes left this PC.
+
+    Follows only this request's own wrapping (requests' ConnectionError ->
+    urllib3's MaxRetryError -> its reason), never __context__: an older
+    refusal still being handled by the caller would otherwise make a gesture
+    that reached WDA look unsent, and it would be replayed."""
+    if not isinstance(exc, requests.ConnectionError) or not exc.args:
+        return False
+    inner = exc.args[0]
+    reason = getattr(inner, "reason", inner)
+    return isinstance(reason, urllib3.exceptions.NewConnectionError)
 
 
 def stop_file():

@@ -135,15 +135,27 @@ class _HangUp(BaseHTTPRequestHandler):
     seen = 0
 
 
-def test_a_call_that_reached_wda_is_never_replayed():
+@pytest.mark.parametrize("inside_old_refusal", [False, True])
+def test_a_call_that_reached_wda_is_never_replayed(inside_old_refusal):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUp)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         _HangUp.seen = 0
         c = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", reconnect_wait=5)
-        with pytest.raises(WDAError) as info:
-            c._request("POST", "/session/x/actions", {"actions": []})
-        assert not isinstance(info.value, WDAUnreachable)
+
+        def gesture():
+            with pytest.raises(WDAError) as info:
+                c._request("POST", "/session/x/actions", {"actions": []})
+            assert not isinstance(info.value, WDAUnreachable)
+
+        if inside_old_refusal:
+            # a caller handling an earlier refusal must not taint this call
+            try:
+                WDAClient(base_url=f"http://127.0.0.1:{_free_port()}", timeout=10).status()
+            except WDAUnreachable:
+                gesture()
+        else:
+            gesture()
         assert _HangUp.seen == 1
     finally:
         server.shutdown()
