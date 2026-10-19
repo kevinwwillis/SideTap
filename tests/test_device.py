@@ -384,3 +384,50 @@ def test_start_tunnel_names_the_phone_when_tunneld_has_no_tunnel(monkeypatch):
         device.start_tunnel()
     assert "no tunnel to the phone" in str(exc.value)
     assert clock[0] >= device._TUNNEL_READY_TIMEOUT
+
+
+def test_list_apps_unreachable_with_no_cache_raises_the_reason(monkeypatch, tmp_path):
+    # An empty list would read as "no such app"; the agent needs the real cause.
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+
+    def down():
+        raise device.link.LinkError("tunneld is not answering at http://127.0.0.1:49151")
+
+    monkeypatch.setattr(device.link, "list_apps", down)
+    with pytest.raises(device.DeviceError, match="tunneld is not answering"):
+        device.list_apps()
+
+
+def test_list_apps_unreachable_uses_the_saved_list(monkeypatch, tmp_path):
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    saved = [{"bundle_id": "com.tencent.xin", "name": "WeChat"}]
+    (tmp_path / "apps.json").write_text(json.dumps(saved), encoding="utf-8")
+    monkeypatch.setattr(device, "_apps_cache_file", lambda: tmp_path / "apps.json")
+
+    def down():
+        raise device.link.LinkError("no tunnel to the phone")
+
+    monkeypatch.setattr(device.link, "list_apps", down)
+    assert device.list_apps() == saved
+
+
+def test_reused_pid_is_not_our_relay(monkeypatch, tmp_path):
+    # The pid in relay.pid now belongs to some other python job (pid reuse after
+    # a reboot): the relay is not running, and stop_all must not kill that job.
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    (tmp_path / "relay.pid").write_text("424242", encoding="utf-8")
+    monkeypatch.setattr(device, "_pid_image", lambda pid: "python.exe")
+    monkeypatch.setattr(device, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "python.exe -m some.other.job")
+    killed = []
+    monkeypatch.setattr(device.subprocess, "run", lambda *a, **k: killed.append(a))
+    assert device.proc_status("relay") == "dead"
+    assert device.stop_all(("relay",)) == []
+    assert killed == []
+
+
+def test_our_relay_pid_is_recognised(monkeypatch, tmp_path):
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    (tmp_path / "relay.pid").write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "pythonw.exe -m phone_harness.relay")
+    assert device.proc_status("relay") == "running"

@@ -86,6 +86,24 @@ Sideloadly at all.
 again (click Start in Sideloadly once when it asks). `phone-harness doctor`
 detects the expiry and reminds you.
 
+### Step 3c — USB or Wi-Fi: the tunnel service
+
+Every phone call goes through pymobiledevice3's `tunneld`, which keeps one
+tunnel to the phone over USB or Wi-Fi, whichever is there. It needs Python 3.13
+or later and admin rights, so it runs as a logon task with no window. The
+one-line installer registers it; by hand, from an admin PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_tunneld_task.ps1 -Python (Get-Command python).Source
+```
+
+For Wi-Fi, pair once over USB (no prompt on the phone), then the cable is
+optional while both are on the same network:
+
+```bat
+python -m pymobiledevice3 lockdown remotepairing --pair
+```
+
 ## Step 4 — verify
 
 ```bat

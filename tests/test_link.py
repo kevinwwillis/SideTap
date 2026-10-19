@@ -220,3 +220,28 @@ def test_tunnel_requests_are_rate_limited(monkeypatch):
         with pytest.raises(link.LinkError, match="no tunnel to the phone"):
             link.tunnel_for()
     assert len(asked) == 1  # one request per interval, not one per connection
+
+
+def test_tunnel_request_failure_is_named(monkeypatch):
+    # A failed request is not "the phone is away": the error says what failed.
+    def urlopen(url, timeout=3.0):
+        if "/start-tunnel" in url:
+            raise link.urllib.error.HTTPError(url, 500, "Internal Server Error", {}, None)
+        return _Resp({})
+
+    monkeypatch.setattr(link.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(link, "_last_request", -1e9)
+    with pytest.raises(link.LinkError, match="tunnel request failed: HTTP 500"):
+        link.tunnel_for(UDID)
+
+
+def test_device_calls_work_from_inside_a_running_event_loop(monkeypatch):
+    # The MCP server runs synchronous tools on its event-loop thread, where
+    # asyncio.run() refuses to start.
+    async def answer():
+        return 42
+
+    async def tool():
+        return link._run_coroutine(answer)
+
+    assert asyncio.run(tool()) == 42

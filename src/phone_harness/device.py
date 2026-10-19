@@ -165,8 +165,17 @@ def list_apps() -> list[dict]:
         return cache["list_apps"]
     try:
         apps = _link(link.list_apps)
-    except DeviceError:
-        apps = []  # unreachable reads like the deep-sleep empty list: use the cache
+    except DeviceError as exc:
+        # Asleep or unreachable: app names do not change while the phone sleeps,
+        # so a saved list still resolves them. With none saved, the caller gets
+        # the real reason, not an empty list that reads as "no such app".
+        try:
+            apps = json.loads(_apps_cache_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise exc from None
+        if cache is not None:
+            cache["list_apps"] = apps
+        return apps
     if apps:
         try:
             config.STATE_DIR.mkdir(exist_ok=True)
@@ -392,7 +401,34 @@ def _pid_image(pid: int) -> str:
         return ""
 
 
-def _safe_kill(pid: int, expected_prefix: str, tree: bool = True) -> bool:
+# What each process we start has on its command line. A pid file outlives its
+# process and Windows reuses pids, so a live pid is ours only if this matches.
+_PROC_MARKERS = {
+    "relay": "phone_harness.relay",
+    "runwda": "xcuitest",
+    "syslog": "syslog",
+}
+
+
+def _pid_cmdline(pid: int) -> str:
+    """The live process's command line, lowercased ('' if dead or unreadable)."""
+    import psutil
+
+    try:
+        return " ".join(psutil.Process(pid).cmdline()).lower()
+    except (psutil.Error, OSError):
+        return ""
+
+
+def _pid_is(name: str, pid: int) -> bool:
+    """Is `pid` still the `name` process we started?"""
+    marker = _PROC_MARKERS.get(name)
+    if marker is None:
+        return _pid_alive(pid)
+    return marker in _pid_cmdline(pid)
+
+
+def _safe_kill(pid: int, expected_prefix: str, tree: bool = True, marker: str | None = None) -> bool:
     """Force-kill `pid` only if its executable name starts with
     `expected_prefix`. Pid files outlive their process and Windows reuses
     pids, so an unchecked kill could hit an innocent process. Returns True
@@ -402,6 +438,8 @@ def _safe_kill(pid: int, expected_prefix: str, tree: bool = True) -> bool:
     of whatever launched them, so killing a viewer's tree takes the phone link
     down with it — see _kill_stale_viewer."""
     if not expected_prefix or not _pid_image(pid).startswith(expected_prefix.lower()):
+        return False
+    if marker is not None and marker not in _pid_cmdline(pid):
         return False
     if sys.platform == "win32":
         cmd = ["taskkill", "/PID", str(pid), "/F"] + (["/T"] if tree else [])
@@ -427,7 +465,7 @@ def proc_status(name: str) -> str:
         pid = int(pf.read_text().strip())
     except ValueError:
         return "not started"
-    return "running" if _pid_alive(pid) else "dead"
+    return "running" if _pid_is(name, pid) else "dead"
 
 
 def log_tail(name: str, lines: int = 5) -> str:
@@ -460,7 +498,7 @@ def stop_all(names: tuple[str, ...] = PROCS) -> list[str]:  # noqa: vulture  (ca
         except ValueError:
             pf.unlink()
             continue
-        if _safe_kill(pid, expected):
+        if _safe_kill(pid, expected, marker=_PROC_MARKERS.get(name)):
             stopped.append(name)
         pf.unlink()
     return stopped
@@ -503,7 +541,8 @@ def start_tunnel() -> None:  # noqa: vulture  (called from admin.py/viewer.py, o
     if not link.tunneld_up():
         raise DeviceError(
             f"tunneld is not running and the '{config.TUNNELD_TASK}' task did not start it. "
-            "Run it from an admin shell: python -m pymobiledevice3 remote tunneld"
+            "Register the task from an admin PowerShell: powershell -ExecutionPolicy Bypass "
+            "-File scripts\\install_tunneld_task.ps1 -Python <the python.exe SideTap uses>"
         )
     raise DeviceError(
         "tunneld is running but has no tunnel to the phone: plug it in by USB, or "

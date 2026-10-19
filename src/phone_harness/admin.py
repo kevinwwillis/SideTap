@@ -518,6 +518,14 @@ def _unwedge(client: WDAClient, wait_seconds: float = 45.0) -> bool:
 def _up(wait_seconds: float) -> int:
     client = WDAClient(timeout=3)
     state = client.link_state()
+    if device.proc_status("relay") != "running":
+        # WDA answering without our relay means an older go-ios link: forwarders
+        # on every PC address and a WDA listening on every phone address. Take
+        # that down and bring WDA up bound to the tunnel instead.
+        if state != "down":
+            print("WDA answers through an older link (go-ios); moving it to the tunnel...")
+        device.stop_all(device.LEGACY_PROCS)
+        state = "down"
     if state == "up":
         print("Already up: WDA is answering.")
         return 0

@@ -15,6 +15,7 @@ measured over Wi-Fi) rather than one `python -m pymobiledevice3` per call (3-7 s
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 import urllib.error
@@ -78,7 +79,7 @@ def _known_udids() -> list[str]:
     try:
         from pymobiledevice3 import usbmux
 
-        udids += [d.serial for d in asyncio.run(usbmux.list_devices())]
+        udids += [d.serial for d in _run_coroutine(usbmux.list_devices)]
     except Exception:
         pass
     records = Path.home() / ".pymobiledevice3"
@@ -86,20 +87,34 @@ def _known_udids() -> list[str]:
     return list(dict.fromkeys(udids))
 
 
-def request_tunnel(udid: str, timeout: float = 15.0) -> bool:
+_UNREACHABLE = "unreachable"  # request_tunnel(): tunneld found no way to the device
+
+
+def request_tunnel(udid: str, timeout: float = 15.0) -> str | None:
     """Ask tunneld to build a tunnel to `udid` now (its /start-tunnel API).
 
-    tunneld's own monitors miss one case: a device that was attached by USB while
-    it already had a Wi-Fi tunnel is never revisited when that tunnel drops,
-    because the USB monitor only acts on attach events (TASK-001.10). Asking is
-    cheap when a tunnel exists (tunneld returns it) and fails fast otherwise.
+    Returns None when tunneld has a tunnel, else why not. tunneld's own monitors
+    miss one case: a device that was attached by USB while it already had a
+    Wi-Fi tunnel is never revisited when that tunnel drops, because the USB
+    monitor only acts on attach events (doronz88/pymobiledevice3#2052). Asking is cheap when a
+    tunnel exists (tunneld returns it) and fails fast otherwise.
     """
     url = f"{TUNNELD_URL}/start-tunnel?udid={urllib.parse.quote(udid)}"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
+        with urllib.request.urlopen(url, timeout=timeout):
+            return None
+    except urllib.error.HTTPError as exc:
+        try:
+            error = json.loads(exc.read().decode("utf-8")).get("error")
+        except (ValueError, AttributeError, OSError):
+            error = None
+        if error == "task not created":
+            return _UNREACHABLE  # tunneld found no way to the device: the usual no-phone case
+        if isinstance(error, dict):
+            error = error.get("exception")
+        return f"tunneld's tunnel request failed: HTTP {exc.code} {error or exc.reason}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return f"tunneld's tunnel request failed: {exc}"
 
 
 def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:
@@ -112,23 +127,42 @@ def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:
         udid = config.SIDETAP_UDID or (sorted(listing)[0] if listing else None)
     entries = listing.get(udid or "", [])
     now = time.monotonic()
+    request_failures: list[str] = []
     if not entries and now - _last_request >= _REQUEST_INTERVAL:
         _last_request = now
         for candidate in [udid] if udid else _known_udids():
-            if request_tunnel(candidate):
+            failure = request_tunnel(candidate)
+            if failure is None:
                 udid = candidate
                 entries = tunnels().get(candidate, [])
                 break
+            if failure != _UNREACHABLE:
+                request_failures.append(failure)
     if not entries:
+        detail = f" ({'; '.join(request_failures)})" if request_failures else ""
         raise LinkError(
             "no tunnel to the phone: it is not on USB, or not on the same Wi-Fi as this PC, "
-            "or it is asleep"
+            f"or it is asleep{detail}"
         )
     entries = sorted(entries, key=lambda e: not _is_usb(e))
     best = entries[0]
     return str(best["tunnel-address"]), int(best["tunnel-port"]), (
         "usb" if _is_usb(best) else "wifi"
     )
+
+
+def _run_coroutine(make: Callable[[], Awaitable[T]]) -> T:
+    """asyncio.run(make()), also from a thread whose event loop is running.
+
+    The MCP server calls synchronous tools on its own event-loop thread, where
+    asyncio.run() refuses to start; there the coroutine runs on a short-lived
+    worker thread with its own loop, and this call waits for it."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(make())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(make())).result()
 
 
 def run(fn: Callable[[Any], Awaitable[T]], udid: str | None = None, timeout: float = 30.0) -> T:
@@ -151,7 +185,7 @@ def run(fn: Callable[[Any], Awaitable[T]], udid: str | None = None, timeout: flo
         return await asyncio.wait_for(main(), timeout)
 
     try:
-        return asyncio.run(bounded())
+        return _run_coroutine(bounded)
     except LinkError:
         raise
     except Exception as exc:  # transport, lockdown or DVT failure, named

@@ -8,7 +8,15 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from test_signing import make_profile  # noqa: E402
 
+import pytest  # noqa: E402
+
 from phone_harness import admin, signing  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _relay_running(monkeypatch):
+    # up() reads the relay's pid file; keep every test off the real .state/.
+    monkeypatch.setattr(admin.device, "proc_status", lambda name: "running")
 
 
 def _use_profile(monkeypatch, tmp_path, data=None):
@@ -448,3 +456,25 @@ def test_wait_for_wda_gives_up_at_the_deadline(monkeypatch):
     assert admin._wait_for_wda(client, deadline) is False
     assert clock[0] >= deadline
     assert clock[0] < deadline + 0.25  # stopped promptly, not overshooting far
+
+
+def test_up_moves_an_older_go_ios_link_to_the_tunnel(monkeypatch, capsys):
+    # WDA answering with no relay of ours: upstream's go-ios forwarders listen on
+    # every PC address and that WDA on every phone address. "Already up" would
+    # keep both; up() must clear them and restart WDA bound to the tunnel.
+    monkeypatch.setattr(admin.device, "proc_status", lambda name: "not started")
+    monkeypatch.setattr(admin, "WDAClient", lambda *a, **k: _StateClient("up"))
+    stopped, started, forwards = [], [], []
+    monkeypatch.setattr(admin.device, "stop_all", lambda names: stopped.append(names) or [])
+    monkeypatch.setattr(admin, "_check_device", lambda: (True, "iPhone", ""))
+    monkeypatch.setattr(admin.device, "tunnel_running", lambda: True)
+    monkeypatch.setattr(admin.device, "ddi_mounted", lambda: True)
+    monkeypatch.setattr(admin.device, "detect_wda_bundle", lambda: "com.x.wda")
+    monkeypatch.setattr(admin.device, "start_wda", lambda b: started.append(b))
+    monkeypatch.setattr(admin.device, "start_forwards", lambda: forwards.append(True))
+    monkeypatch.setattr(admin, "_wait_for_wda", lambda *a, **k: True)
+
+    assert admin._up(wait_seconds=1) == 0
+    assert stopped == [admin.device.LEGACY_PROCS]
+    assert started == ["com.x.wda"] and forwards == [True]
+    assert "older link" in capsys.readouterr().out

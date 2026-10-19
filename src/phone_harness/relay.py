@@ -22,6 +22,7 @@ DEVICE_MJPEG_PORT = 9100
 _LOOKUP_TTL = 2.0  # seconds a tunnel lookup is reused across a burst of connections
 
 _cached: tuple[float, str] | None = None
+_last_failure = ""  # last reason a connection could not reach the phone, logged once
 
 
 def _tunnel_address() -> str:
@@ -85,7 +86,7 @@ def _maybe_heal() -> None:
 
 def _handler(device_port: int):
     async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
-        global _cached
+        global _cached, _last_failure
         try:
             address = await asyncio.to_thread(_tunnel_address)
             dev_r, dev_w = await asyncio.wait_for(
@@ -96,9 +97,14 @@ def _handler(device_port: int):
             # which is exactly what the callers already handle.
             client_w.close()
             _cached = None  # look the tunnel up afresh next time
+            reason = f"{type(exc).__name__}: {exc}"
+            if reason != _last_failure:
+                _last_failure = reason
+                print(f"{time.ctime()} cannot reach the phone: {reason}", flush=True)
             if device_port == DEVICE_WDA_PORT and not isinstance(exc, link.LinkError):
                 _maybe_heal()
             return
+        _last_failure = ""
         await asyncio.gather(_pipe(client_r, dev_w), _pipe(dev_r, client_w))
 
     return handle
