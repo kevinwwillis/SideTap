@@ -323,15 +323,29 @@ def mark_wda_idle() -> None:
     _idle_file().write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
 
 
-@contextlib.contextmanager
 def wda_lifecycle_lock():
     """Held, across processes, while WDA is started or idle-stopped.
 
     The relay idle-stops WDA from its own process; without this a manual
     `phone-harness up` or the viewer could start a runner between the relay's
     "still idle?" check and its kill, and the relay would kill the new one."""
+    return _file_lock("wda-lifecycle.lock")
+
+
+def relay_start_lock():
+    """Held, across processes, while the relay is checked and started.
+
+    Agent clients start a relay they find missing (TASK-001.15); two at once
+    would both spawn one, and the loser of the port bind could own relay.pid
+    while the winner runs unrecorded, out of reach of `down`."""
+    return _file_lock("relay-start.lock")
+
+
+@contextlib.contextmanager
+def _file_lock(name: str):
+    """An exclusive lock on .state/<name>, across processes. Not reentrant."""
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(config.STATE_DIR / "wda-lifecycle.lock", "a+b") as f:
+    with open(config.STATE_DIR / name, "a+b") as f:
         if sys.platform == "win32":
             import msvcrt
 
@@ -379,10 +393,12 @@ _LOG_KEEP = 1024 * 1024  # bytes of a spawned process's log kept across restarts
 def _open_log(name: str):
     """A spawned process's log, opened for appending: the end of the previous
     run's log is the only record of how it stopped (TASK-001.15). Cut back to
-    its last _LOG_KEEP bytes, then marked with this start."""
+    its last _LOG_KEEP bytes, then marked with this start. Never cut while an
+    earlier run still writes it: on Windows its handle keeps the old offset
+    and fills the gap with NUL bytes."""
     path = _log_file(name)
     try:
-        if path.stat().st_size > _LOG_KEEP:
+        if path.stat().st_size > _LOG_KEEP and proc_status(name) != "running":
             path.write_bytes(path.read_bytes()[-_LOG_KEEP:])
     except OSError:
         pass
@@ -737,7 +753,11 @@ def _free_port(port: int) -> None:
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        if "ios.exe" in info.stdout.lower():
+        # Only a go-ios forwarder on this port: agent calls now reach this
+        # path on their own (TASK-001.15), so an ios.exe doing anything else
+        # (another session's tunnel, a syslog) is never killed by name alone.
+        cmd = _pid_cmdline(int(pid)) if pid.isdigit() else ""
+        if "ios.exe" in info.stdout.lower() and " forward" in cmd and str(port) in cmd:
             subprocess.run(
                 ["taskkill", "/F", "/PID", pid],
                 capture_output=True,
@@ -825,12 +845,13 @@ def start_forwards() -> None:  # noqa: vulture  (called from admin.py/viewer.py,
 
     It follows the tunnel on its own, so a replug or a Wi-Fi reconnect needs no
     restart of the relay. Leftover go-ios forwarders on the same ports are
-    cleared first."""
-    if proc_status("relay") == "running":
-        return
-    _free_port(config.WDA_PORT)
-    _free_port(config.MJPEG_PORT)
-    _spawn_py("relay", ["-m", "phone_harness.relay"])
+    cleared first. Serialized across processes (relay_start_lock)."""
+    with relay_start_lock():
+        if proc_status("relay") == "running":
+            return
+        _free_port(config.WDA_PORT)
+        _free_port(config.MJPEG_PORT)
+        _spawn_py("relay", ["-m", "phone_harness.relay"])
 
 
 def current_udid() -> str | None:  # noqa: vulture  (used by signing.py)

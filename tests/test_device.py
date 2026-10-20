@@ -526,3 +526,63 @@ def test_spawn_keeps_the_previous_runs_log(tmp_path, monkeypatch):
     text = (tmp_path / "relay.log").read_text(encoding="utf-8")
     assert "last words of the old relay" in text and "new run" in text
     assert text.index("last words") < text.index("started") < text.index("new run")
+
+
+def test_concurrent_relay_starts_spawn_one(tmp_path, monkeypatch):
+    """Two agents finding the relay missing at once must not start two (review 2026-10-20)."""
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(device, "_free_port", lambda port: None)
+    spawned = []
+
+    def spawn(name, args):
+        time.sleep(0.3)  # the gap in which a second caller would also see no relay
+        spawned.append(name)
+        device._pid_file(name).write_text("1", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(device, "_spawn_py", spawn)
+    monkeypatch.setattr(device, "proc_status", lambda name: "running" if spawned else "not started")
+    ts = [threading.Thread(target=device.start_forwards) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    assert spawned == ["relay"]
+
+
+def test_log_is_not_cut_while_an_earlier_run_writes_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(device, "_LOG_KEEP", 10)
+    (tmp_path / "relay.log").write_text("x" * 100, encoding="utf-8")
+    monkeypatch.setattr(device, "proc_status", lambda name: "running")
+    device._open_log("relay").close()
+    assert (tmp_path / "relay.log").read_text(encoding="utf-8").startswith("x" * 100)
+    monkeypatch.setattr(device, "proc_status", lambda name: "not started")
+    device._open_log("relay").close()
+    assert not (tmp_path / "relay.log").read_text(encoding="utf-8").startswith("x" * 100)
+
+
+def test_free_port_kills_only_a_go_ios_forwarder(monkeypatch):
+    """An ios.exe on the port that is not `ios forward <port>` is left alone."""
+    monkeypatch.setattr(device.sys, "platform", "win32")
+    killed = []
+
+    class R:
+        def __init__(self, out=""):
+            self.stdout = out
+
+    def run(cmd, **kw):
+        if cmd[0] == "netstat":
+            return R("  TCP    127.0.0.1:9100   0.0.0.0:0   LISTENING   4242\n")
+        if cmd[0] == "tasklist":
+            return R("ios.exe   4242 Console 1 10,000 K")
+        killed.append(cmd)
+        return R()
+
+    monkeypatch.setattr(device.subprocess, "run", run)
+    monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "ios.exe tunnel start --userspace")
+    device._free_port(9100)
+    assert killed == []
+    monkeypatch.setattr(device, "_pid_cmdline", lambda pid: "ios.exe forward 9100 9100 --udid x")
+    device._free_port(9100)
+    assert killed and killed[0][:2] == ["taskkill", "/F"]
