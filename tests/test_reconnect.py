@@ -159,3 +159,69 @@ def test_a_call_that_reached_wda_is_never_replayed(inside_old_refusal):
         assert _HangUp.seen == 1
     finally:
         server.shutdown()
+
+
+class _Ok(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # noqa: vulture
+        pass
+
+    def do_GET(self):  # noqa: vulture
+        body = b'{"value": {"ready": true}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def relay_port(monkeypatch):
+    port = _free_port()
+    monkeypatch.setattr(config, "WDA_PORT", port)
+    servers = []
+    yield port, servers
+    for s in servers:
+        s.shutdown()
+
+
+def test_agent_call_starts_a_relay_that_is_not_running(relay_port, monkeypatch):
+    """After a reboot nothing starts the relay (TASK-001.15); the first agent call does."""
+    port, servers = relay_port
+    starts = []
+
+    def start():
+        starts.append(1)
+        s = ThreadingHTTPServer(("127.0.0.1", port), _Ok)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        servers.append(s)
+
+    monkeypatch.setattr(wda_client, "_start_relay", start)
+    c = WDAClient(base_url=f"http://127.0.0.1:{port}", reconnect_wait=10)
+    assert c.status() == {"ready": True}
+    assert starts == [1]
+
+
+def test_relay_is_started_once_per_call(relay_port, monkeypatch):
+    port, _ = relay_port
+    starts = []
+    monkeypatch.setattr(wda_client, "_start_relay", lambda: starts.append(1))
+    c = WDAClient(base_url=f"http://127.0.0.1:{port}", reconnect_wait=0.5)
+    with pytest.raises(WDAUnreachable):
+        c.status()
+    assert starts == [1]
+
+
+def test_probe_client_never_starts_the_relay(relay_port, monkeypatch):
+    """`doctor` and `up` must see a down link as it is."""
+    port, _ = relay_port
+    monkeypatch.setattr(wda_client, "_start_relay", lambda: pytest.fail("probe started the relay"))
+    with pytest.raises(WDAUnreachable):
+        WDAClient(base_url=f"http://127.0.0.1:{port}").status()
+
+
+def test_a_marked_503_does_not_start_another_relay(relay_to_nowhere, monkeypatch):
+    """The relay answered, so it is running; only WDA behind it is down."""
+    monkeypatch.setattr(config, "WDA_PORT", int(relay_to_nowhere.rsplit(":", 1)[1]))
+    monkeypatch.setattr(wda_client, "_start_relay", lambda: pytest.fail("relay was running"))
+    with pytest.raises(WDAUnreachable):
+        WDAClient(base_url=relay_to_nowhere, timeout=5, reconnect_wait=0.3).status()

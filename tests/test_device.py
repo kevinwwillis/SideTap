@@ -3,6 +3,7 @@
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -508,3 +509,20 @@ def test_stopping_the_relay_spares_the_wda_it_started(tmp_path, monkeypatch):
             except psutil.Error:
                 pass
         top.kill()
+
+
+def test_spawn_keeps_the_previous_runs_log(tmp_path, monkeypatch):
+    """A restart must not wipe the log that says how the last run ended (TASK-001.15)."""
+    import subprocess as sp
+
+    monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(device, "_pythonw", lambda: sys.executable)
+    (tmp_path / "relay.log").write_text("last words of the old relay\n", encoding="utf-8")
+    pid = device._spawn_py("relay", ["-c", "print('new run')"])
+    for _ in range(100):
+        if "new run" in (tmp_path / "relay.log").read_text(encoding="utf-8"):
+            break
+        time.sleep(0.05)
+    text = (tmp_path / "relay.log").read_text(encoding="utf-8")
+    assert "last words of the old relay" in text and "new run" in text
+    assert text.index("last words") < text.index("started") < text.index("new run")
