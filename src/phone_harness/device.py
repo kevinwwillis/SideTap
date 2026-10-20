@@ -387,7 +387,7 @@ def _open_log(name: str):
     except OSError:
         pass
     log = open(path, "a", encoding="utf-8")
-    log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {name} started\n")
+    log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} {name} started\n")
     log.flush()
     return log
 
