@@ -373,13 +373,32 @@ def wda_idle_since() -> str | None:
         return None
 
 
+_LOG_KEEP = 1024 * 1024  # bytes of a spawned process's log kept across restarts
+
+
+def _open_log(name: str):
+    """A spawned process's log, opened for appending: the end of the previous
+    run's log is the only record of how it stopped (TASK-001.15). Cut back to
+    its last _LOG_KEEP bytes, then marked with this start."""
+    path = _log_file(name)
+    try:
+        if path.stat().st_size > _LOG_KEEP:
+            path.write_bytes(path.read_bytes()[-_LOG_KEEP:])
+    except OSError:
+        pass
+    log = open(path, "a", encoding="utf-8")
+    log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} {name} started\n")
+    log.flush()
+    return log
+
+
 def _spawn(name: str, args: list[str]) -> int:
     """Start `ios <args>` detached; record pid and send output to a log file."""
     exe = ios_path()
     if not exe:
         raise DeviceError("go-ios not found on PATH. Install it: npm install -g go-ios")
     config.STATE_DIR.mkdir(exist_ok=True)
-    log = open(_log_file(name), "w", encoding="utf-8")
+    log = _open_log(name)
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -404,7 +423,7 @@ def _pythonw() -> str:
 def _spawn_py(name: str, args: list[str]) -> int:
     """Start `pythonw <args>` detached with this package importable; pid + log in .state/."""
     config.STATE_DIR.mkdir(exist_ok=True)
-    log = open(_log_file(name), "w", encoding="utf-8")
+    log = _open_log(name)
     env = dict(os.environ)
     src = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")

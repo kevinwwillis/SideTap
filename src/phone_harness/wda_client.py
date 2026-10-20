@@ -37,6 +37,11 @@ class WDAUnreachable(WDAError):
     marked 503) or nothing listened on the relay port. Replaying is safe for
     any request, gestures included, because nothing acted."""
 
+    def __init__(self, *args, nothing_listening: bool = False):
+        super().__init__(*args)
+        # True when the TCP connect itself was refused: no relay is running.
+        self.nothing_listening = nothing_listening
+
 
 # Set by relay.py on the 503 it sends when WDA is out of reach.
 UNREACHABLE_HEADER = "X-Phone-Relay"
@@ -58,6 +63,16 @@ def _never_connected(exc: requests.RequestException) -> bool:
     inner = exc.args[0]
     reason = getattr(inner, "reason", inner)
     return isinstance(reason, urllib3.exceptions.NewConnectionError)
+
+
+def _start_relay() -> None:
+    """Start the loopback relay (device.start_forwards), which then brings WDA
+    up through its own self-heal. Nothing starts the relay at logon, so after
+    a reboot the first agent call would otherwise fail (TASK-001.15). Lazy
+    import: device pulls in go-ios, which this module otherwise avoids."""
+    from . import device
+
+    device.start_forwards()
 
 
 def stop_file():
@@ -309,6 +324,7 @@ class WDAClient:
         # GETs (perception) and session creation stay allowed so the viewer can
         # still show the screen while stopped.
         deadline = time.monotonic() + self.reconnect_wait
+        relay_started = False
         while True:
             if method == "POST" and path != "/session" and stop_engaged():
                 raise WDAError(
@@ -317,10 +333,30 @@ class WDAClient:
                 )
             try:
                 return self._request_once(method, path, payload)
-            except WDAUnreachable:
+            except WDAUnreachable as exc:
+                # Before the deadline check: a refused connect alone takes ~2 s
+                # on Windows. Probe clients (reconnect_wait 0) never start it.
+                if (
+                    self.reconnect_wait > 0
+                    and exc.nothing_listening
+                    and not relay_started
+                    and self._is_relay()
+                ):
+                    relay_started = True
+                    try:
+                        _start_relay()
+                    except Exception:
+                        pass  # the retries below report the link as down
                 if time.monotonic() + _RECONNECT_POLL > deadline:
                     raise
                 time.sleep(_RECONNECT_POLL)
+
+    def _is_relay(self) -> bool:
+        """This client talks to this PC's own relay port (not a test server)."""
+        return self.base_url in (
+            f"http://127.0.0.1:{config.WDA_PORT}",
+            f"http://localhost:{config.WDA_PORT}",
+        )
 
     def _request_once(self, method: str, path: str, payload: dict | None) -> Any:
         url = self.base_url + path
@@ -342,11 +378,13 @@ class WDAClient:
                 "in front, which releases WDA."
             ) from exc
         except requests.RequestException as exc:
-            kind = WDAUnreachable if _never_connected(exc) else WDAError
-            raise kind(
+            msg = (
                 f"Cannot reach WebDriverAgent at {self.base_url}. "
                 "Run `phone-harness up` (and check `phone-harness doctor`)."
-            ) from exc
+            )
+            if _never_connected(exc):
+                raise WDAUnreachable(msg, nothing_listening=True) from exc
+            raise WDAError(msg) from exc
         if resp.headers.get(UNREACHABLE_HEADER) == "unreachable":
             raise WDAUnreachable(
                 f"Cannot reach WebDriverAgent through the relay at {self.base_url} "
