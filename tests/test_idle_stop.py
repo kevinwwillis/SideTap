@@ -301,3 +301,29 @@ def test_a_request_on_a_pooled_connection_after_the_cut_is_marked_unreachable(
     with pytest.raises(WDAUnreachable, match="idle"):
         c._request("POST", "/wda/homescreen", {"x": 1})  # same pooled connection
     assert seen == ["/wda/homescreen"]  # the second call never reached WDA
+
+
+def test_stop_link_stops_wda_and_marks_it_idle(runner):
+    """Agents end their automation at once (TASK-001.16): banner gone, doctor green."""
+    from phone_harness import helpers
+
+    assert helpers.stop_link() == "stopped"
+    assert runner["stops"] == 1
+    assert device.wda_idle_since()
+    assert helpers.stop_link() == "was not running"
+    assert runner["stops"] == 1
+
+
+def test_stop_link_cli(runner, capsys):
+    from phone_harness import run
+
+    assert run.main(["stop-link"]) == 0
+    assert "WDA stopped" in capsys.readouterr().out
+    assert runner["stops"] == 1
+
+
+def test_stop_link_is_an_mcp_tool():
+    from phone_harness import mcp_server
+
+    names = {t.name for t in asyncio.run(mcp_server.server.list_tools())}
+    assert "stop_link" in names

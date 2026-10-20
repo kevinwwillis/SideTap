@@ -323,6 +323,22 @@ def mark_wda_idle() -> None:
     _idle_file().write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
 
 
+def release_wda() -> bool:
+    """Stop WDA now because the agent is done, as the idle stop would later.
+
+    iOS shows "Automation Running" and dims the screen for as long as WDA runs
+    (Kevin, 2026-10-20: "when you're done, you need to break the link"). The
+    relay stays up and WDA is marked idle, so doctor stays green and the next
+    call through the relay starts WDA again. Returns False when it was not
+    running."""
+    with wda_lifecycle_lock():
+        if proc_status("runwda") != "running":
+            return False
+        stop_all(("runwda",))
+        mark_wda_idle()
+    return True
+
+
 def wda_lifecycle_lock():
     """Held, across processes, while WDA is started or idle-stopped.
 

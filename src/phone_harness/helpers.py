@@ -2034,6 +2034,13 @@ def compact(rows: list[dict], limit: int | None = 60) -> list[dict]:
     return out
 
 
+def stop_link() -> str:
+    """Call when you are done with the phone: stops WebDriverAgent now, so iOS
+    drops its "Automation Running" banner and stops dimming the screen. The
+    next tool call brings it back by itself (about 20 s)."""
+    return "stopped" if device.release_wda() else "was not running"
+
+
 __all__ = [
     "client",
     "screenshot",
@@ -2069,5 +2076,6 @@ __all__ = [
     "wait_stable",
     "wait_for_text",
     "unlock",
+    "stop_link",
     "WDAError",
 ]
