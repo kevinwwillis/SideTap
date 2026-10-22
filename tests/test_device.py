@@ -375,6 +375,7 @@ def test_start_tunnel_returns_as_soon_as_a_tunnel_is_listed(monkeypatch):
 def test_start_tunnel_starts_the_tunneld_task_when_tunneld_is_down(monkeypatch):
     _clock, _probes, started = _tunnel_env(monkeypatch, listed_on_call=1, tunneld_up=False)
     device.start_tunnel()
+    started = [c for c in started if "/Query" not in c]  # the task's status is read first
     assert started and started[0][:3] == ["schtasks", "/Run", "/TN"]
     assert started[0][3] == device.config.TUNNELD_TASK
 
@@ -383,7 +384,7 @@ def test_start_tunnel_names_tunneld_when_it_never_comes_up(monkeypatch):
     _tunnel_env(monkeypatch, listed_on_call=10_000, tunneld_up=False)
     with pytest.raises(device.DeviceError) as exc:
         device.start_tunnel()
-    assert "tunneld is not running" in str(exc.value)
+    assert "tunneld is not answering" in str(exc.value)
 
 
 def test_start_tunnel_names_the_phone_when_tunneld_has_no_tunnel(monkeypatch):

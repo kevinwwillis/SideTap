@@ -109,6 +109,18 @@ def _close_dump() -> None:
             _dump = None
 
 
+def stop() -> None:
+    """End the capture: the viewer runs it only while one of its pages is open,
+    because its stream is traffic to the iPad, and with no agent or person
+    working nothing should reach a sleeping iPad (TASK-001.18)."""
+    global _proc, _next_attempt
+    if _proc is None:
+        return
+    _proc = None
+    _next_attempt = 0.0  # a page that opens again starts it at once
+    device.stop_all(("syslog",))
+
+
 def start() -> bool:
     """Begin (or resume) capturing. Idempotent; a no-op once running."""
     global _proc, _next_attempt

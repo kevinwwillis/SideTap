@@ -37,6 +37,12 @@ def _check_go_ios():
 
 def _check_device():
     try:
+        # A Wi-Fi tunnel exists only once asked for (tunneld runs with --no-wifi),
+        # so ask before reading the listing; tunnel_for() rate-limits the request.
+        device.link.tunnel_for()
+    except Exception:
+        pass  # the listing below reports the phone as unreachable
+    try:
         udids = device.list_devices()
     except Exception as exc:
         return (

@@ -130,11 +130,68 @@ def _json_lines(text: str) -> list[dict]:
 
 
 def _link(fn, *args):
-    """Call a link.py function, reporting its failures as DeviceError."""
+    """Call a link.py function, reporting its failures as DeviceError.
+
+    When tunneld itself is not answering, start it and try once more: device
+    calls (app list, open apps, kill) reach the phone without the relay, so the
+    relay's self-heal never sees them (TASK-001.17)."""
+    try:
+        return fn(*args)
+    except link.TunneldDown as exc:
+        if not _restart_tunneld():
+            raise DeviceError(str(exc)) from exc
+    except link.LinkError as exc:
+        raise DeviceError(str(exc)) from exc
     try:
         return fn(*args)
     except link.LinkError as exc:
         raise DeviceError(str(exc)) from exc
+
+
+_TUNNELD_RESTART_INTERVAL = 30.0  # seconds between two restarts from this process
+_last_tunneld_restart = -1e9
+_TUNNELD_HUNG_PROBE = 10.0  # a tunneld silent this long while its task runs is hung
+
+
+def _schtasks(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["schtasks", *args, "/TN", config.TUNNELD_TASK],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+
+def _start_tunneld_task() -> None:
+    """Start tunneld's task; end it first if it runs but tunneld never answers.
+
+    The task is registered with MultipleInstances IgnoreNew, so /Run does
+    nothing while a hung instance holds it. A tunneld that answers within the
+    longer probe is left alone: only a silent one is ended."""
+    if link.tunneld_up():
+        return
+    query = _schtasks("/Query", "/FO", "CSV", "/NH")
+    if '"Running"' in (query.stdout or ""):
+        if link.tunneld_up(timeout=_TUNNELD_HUNG_PROBE):
+            return  # slow, not hung
+        _schtasks("/End")
+    _schtasks("/Run")
+
+
+def _restart_tunneld() -> bool:
+    """Start tunneld (rate-limited) and wait for its API. True once it answers."""
+    global _last_tunneld_restart
+    now = time.monotonic()
+    if now - _last_tunneld_restart < _TUNNELD_RESTART_INTERVAL:
+        return False
+    _last_tunneld_restart = now
+    _start_tunneld_task()
+    deadline = time.monotonic() + _TUNNEL_READY_TIMEOUT
+    while time.monotonic() < deadline:
+        if link.tunneld_up():
+            return True
+        time.sleep(_TUNNEL_READY_POLL)
+    return False
 
 
 def list_devices() -> list[str]:
@@ -665,14 +722,7 @@ def start_tunnel() -> None:  # noqa: vulture  (called from admin.py/viewer.py, o
     logon task; this starts that task if tunneld is not answering, then waits
     for a tunnel. USB or Wi-Fi: tunneld picks whichever link the phone is on.
     """
-    if not link.tunneld_up():
-        task = config.TUNNELD_TASK
-        subprocess.run(
-            ["schtasks", "/Run", "/TN", task],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+    _start_tunneld_task()
     deadline = time.monotonic() + _TUNNEL_READY_TIMEOUT
     while time.monotonic() < deadline:
         if tunnel_running():
@@ -680,7 +730,7 @@ def start_tunnel() -> None:  # noqa: vulture  (called from admin.py/viewer.py, o
         time.sleep(_TUNNEL_READY_POLL)
     if not link.tunneld_up():
         raise DeviceError(
-            f"tunneld is not running and the '{config.TUNNELD_TASK}' task did not start it. "
+            f"tunneld is not answering and the '{config.TUNNELD_TASK}' task did not start it. "
             "Register the task from an admin PowerShell: powershell -ExecutionPolicy Bypass "
             "-File scripts\\install_tunneld_task.ps1 -Python <the python.exe SideTap uses>"
         )
