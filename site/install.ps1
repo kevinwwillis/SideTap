@@ -168,14 +168,28 @@ if (Test-AppleDriver) {
 # prompt here, then it starts at every logon with no window.
 Step '6/7 tunneld logon task (admin prompt)'
 $taskScript = Join-Path $app 'scripts\install_tunneld_task.ps1'
-$p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$taskScript`"", '-Python', "`"$python`"")
-if ($p.ExitCode -ne 0) {
-    Write-Host "    not registered (exit $($p.ExitCode)). From an admin PowerShell run:" -ForegroundColor Yellow
+# Declining the UAC prompt makes Start-Process throw; that must not abort the
+# rest of the install, only leave this step for later.
+$exit = $null
+try {
+    $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$taskScript`"", '-Python', "`"$python`"")
+    $exit = $p.ExitCode
+} catch {
+    $exit = 'admin prompt declined'
+}
+if ($exit -ne 0) {
+    Write-Host "    not registered ($exit). Until it is, SideTap cannot reach the phone. From an admin PowerShell run:" -ForegroundColor Yellow
     Write-Host "      powershell -ExecutionPolicy Bypass -File `"$taskScript`" -Python `"$python`""
 } else {
     Write-Host '    done'
 }
+
+# The launchers (sidetap.cmd, phone-harness.cmd) run SIDETAP_PYTHON when it is
+# set, so they use the Python the packages were just installed into, not
+# whichever older one comes first on PATH.
+[Environment]::SetEnvironmentVariable('SIDETAP_PYTHON', $python, 'User')
+$env:SIDETAP_PYTHON = $python
 
 # ---- 7/7 Shortcut ----------------------------------------------------------
 Step '7/7 Desktop + Start Menu shortcut'
@@ -187,7 +201,7 @@ Write-Host 'SideTap is installed.' -ForegroundColor Green
 Write-Host ''
 if (-not (Test-AppleDriver)) {
     Write-Host 'ONE THING IS STILL MISSING: the Apple Devices app (the USB driver).' -ForegroundColor Red
-    Write-Host 'Until you install it, SideTap will say "No iPhone found over USB".' -ForegroundColor Red
+    Write-Host 'Until you install it, SideTap cannot see the phone over USB.' -ForegroundColor Red
     Write-Host '  1. Microsoft Store -> search "Apple Devices" (free, made by Apple) -> Get' -ForegroundColor Red
     Write-Host '     or: https://apps.microsoft.com/detail/9np83lwlpz9k' -ForegroundColor Red
     Write-Host '  2. Replug the iPhone, unlock it, tap Trust.' -ForegroundColor Red
