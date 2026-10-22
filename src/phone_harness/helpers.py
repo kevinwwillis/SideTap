@@ -2037,7 +2037,9 @@ def compact(rows: list[dict], limit: int | None = 60) -> list[dict]:
 def stop_link() -> str:
     """Call when you are done with the phone: stops WebDriverAgent now, so iOS
     drops its "Automation Running" banner and stops dimming the screen. The
-    next tool call brings it back by itself (about 20 s)."""
+    relay then closes the tunnel to the device once nothing has used it for
+    TUNNEL_IDLE_CLOSE_MINUTES (2). The next tool call brings both back by
+    itself (about 20 s)."""
     return "stopped" if device.release_wda() else "was not running"
 
 

@@ -59,6 +59,36 @@ def tunnels(timeout: float = 3.0) -> dict[str, list[dict]]:
     return {udid: list(entries or []) for udid, entries in (data or {}).items() if entries}
 
 
+def _used_file() -> Path:
+    return config.STATE_DIR / "link-used"
+
+
+def mark_used() -> None:
+    """Record, across processes, that something is using the device now."""
+    try:
+        _used_file().touch()
+    except OSError:
+        pass  # a missing mark only lets an idle tunnel close sooner
+
+
+def used_age() -> float | None:
+    """Seconds since any process last used the device, None if never."""
+    try:
+        return max(0.0, time.time() - _used_file().stat().st_mtime)
+    except OSError:
+        return None
+
+
+def close_tunnel(udid: str, timeout: float = 5.0) -> bool:
+    """Ask tunneld to close the device's tunnel (its /cancel API)."""
+    url = f"{TUNNELD_URL}/cancel?udid={urllib.parse.quote(udid)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return bool(json.loads(resp.read().decode("utf-8")).get("data"))
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        return False
+
+
 def tunneld_up(timeout: float = 3.0) -> bool:
     try:
         tunnels(timeout)
@@ -149,8 +179,11 @@ def request_tunnel(udid: str, timeout: float = 15.0) -> str | None:
 def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:
     """(address, rsd port, "usb"|"wifi") of the device's tunnel, USB first.
 
-    With no tunnel listed, asks tunneld for one (at most every _REQUEST_INTERVAL)."""
+    With no tunnel listed, asks tunneld for one (at most every _REQUEST_INTERVAL).
+    Every device call comes through here, so it also marks the device as in use,
+    which keeps the relay from closing an idle tunnel under it."""
     global _last_request
+    mark_used()
     listing = tunnels()
     if udid is None:
         udid = config.SIDETAP_UDID or (sorted(listing)[0] if listing else None)

@@ -327,3 +327,94 @@ def test_stop_link_is_an_mcp_tool():
 
     names = {t.name for t in asyncio.run(mcp_server.server.list_tools())}
     assert "stop_link" in names
+
+
+@pytest.fixture
+def tunneld(monkeypatch):
+    """A fake tunneld with one tunnel open; /cancel closes it."""
+    state = {"open": {"UDID-1"}, "cancels": []}
+    monkeypatch.setattr(
+        relay.link, "tunnels", lambda timeout=3.0: {u: [{"tunnel-address": "fd00::1"}] for u in state["open"]}
+    )
+
+    def close(udid, timeout=5.0):
+        state["cancels"].append(udid)
+        state["open"].discard(udid)
+        return True
+
+    monkeypatch.setattr(relay.link, "close_tunnel", close)
+    return state
+
+
+def test_idle_device_tunnel_is_closed_once_wda_is_stopped(runner, tunneld, monkeypatch):
+    """An idle open tunnel keeps Windows re-identifying its adapter (TASK-001.18)."""
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    assert relay._idle_close(120)
+    assert tunneld["cancels"] == ["UDID-1"]
+
+
+def test_tunnel_stays_while_wda_runs(runner, tunneld, monkeypatch):
+    """WDA is bound to the tunnel; closing it would cost a full WDA restart."""
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    assert not relay._idle_close(120)
+    assert tunneld["cancels"] == []
+
+
+def test_tunnel_stays_with_recent_relay_traffic(runner, tunneld, monkeypatch):
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 30)
+    assert not relay._idle_close(120)
+    assert tunneld["cancels"] == []
+
+
+def test_tunnel_stays_while_another_process_uses_the_device(runner, tunneld, monkeypatch):
+    """Direct device calls (app list, syslog) skip the relay; link.tunnel_for marks them."""
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    relay.link.mark_used()
+    assert not relay._idle_close(120)
+    assert tunneld["cancels"] == []
+
+
+def test_device_calls_mark_the_device_in_use(monkeypatch):
+    monkeypatch.setattr(relay.link, "tunnels", lambda timeout=3.0: {"U": [{"tunnel-address": "fd00::1", "tunnel-port": 1, "interface": "en0"}]})
+    assert relay.link.used_age() is None
+    relay.link.tunnel_for("U")
+    assert relay.link.used_age() < 5
+
+
+def test_no_close_during_a_heal(runner, tunneld, monkeypatch):
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    monkeypatch.setattr(relay, "_healing", True)
+    assert not relay._idle_close(120)
+    assert tunneld["cancels"] == []
+
+
+def test_close_check_gates_new_connections_and_survives_tunneld_down(runner, monkeypatch):
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    pooled = _pooled()
+    monkeypatch.setattr(relay, "_open", {pooled})
+
+    def down(timeout=3.0):
+        raise relay.link.TunneldDown("tunneld is not answering")
+
+    monkeypatch.setattr(relay.link, "tunnels", down)
+    asyncio.run(relay._close_check(120))  # must not raise
+    assert pooled.cut and relay._gate is None
+
+
+def test_close_tunnel_reads_tunnelds_answer(monkeypatch):
+    import io
+
+    seen = []
+
+    def urlopen(url, timeout):
+        seen.append(url)
+        return io.BytesIO(b'{"operation": "cancel", "data": true}')
+
+    monkeypatch.setattr(relay.link.urllib.request, "urlopen", urlopen)
+    assert relay.link.close_tunnel("UDID 1")
+    assert seen == [relay.link.TUNNELD_URL + "/cancel?udid=UDID%201"]

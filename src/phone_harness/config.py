@@ -50,6 +50,12 @@ WDA_URL = f"http://127.0.0.1:{WDA_PORT}"
 # it, and the next call starts it again (relay self-heal). 0 keeps WDA running.
 WDA_IDLE_STOP_MINUTES = float(get("WDA_IDLE_STOP_MINUTES", "10") or "10")
 
+# Once WDA is stopped, the relay closes the tunnel to the device after this many
+# minutes with nothing using the device. An open but idle tunnel keeps Windows
+# re-identifying its network adapter every few minutes (TASK-001.18); the next
+# call builds a new one in a few seconds. 0 keeps tunnels open.
+TUNNEL_IDLE_CLOSE_MINUTES = float(get("TUNNEL_IDLE_CLOSE_MINUTES", "2") or "2")
+
 # go-ios's tunnel agent HTTP port, shared by the tunnel it starts and every
 # go-ios call that looks the tunnel up. go-ios defaults to 60105, inside
 # Windows' dynamic range (49152-65535) where Hyper-V/WinNAT reserve blocks at

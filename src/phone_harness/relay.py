@@ -9,7 +9,9 @@ connection and pipes bytes both ways. It listens on loopback only: unlike
 
 It also stops WDA after config.WDA_IDLE_STOP_MINUTES with no traffic, because
 iOS shows its "Automation Running" banner for as long as WDA runs; the next
-call finds WDA stopped and the self-heal starts it again.
+call finds WDA stopped and the self-heal starts it again. Once WDA is stopped
+and nothing has used the device for config.TUNNEL_IDLE_CLOSE_MINUTES, it closes
+the tunnel too (TASK-001.18); the next call asks tunneld for a new one.
 
 Run detached by device.start_forwards(): `pythonw -m phone_harness.relay`.
 """
@@ -272,10 +274,59 @@ def _idle_stop(idle_seconds: float) -> bool:
     return True
 
 
-async def _idle_watch(idle_seconds: float) -> None:
+def _idle_close(close_seconds: float) -> bool:
+    """Close the device's tunnel once WDA is stopped and nothing, in any
+    process, has used the device for `close_seconds`.
+
+    An open but idle tunnel keeps Windows re-identifying its network adapter
+    every few minutes, which wakes everything that watches network changes
+    (TASK-001.18). The next device call asks tunneld for a new tunnel
+    (link.tunnel_for), a few seconds. Never while WDA runs: WDA is bound to the
+    tunnel, and closing it would cost the next call a full WDA restart."""
+    global _cached
+    from . import device
+
+    with _lifecycle, device.wda_lifecycle_lock():
+        if _healing or time.monotonic() - _last_traffic < close_seconds:
+            return False
+        if device.proc_status("runwda") == "running":
+            return False
+        age = link.used_age()
+        if age is not None and age < close_seconds:
+            return False
+        closed = [udid for udid in link.tunnels() if link.close_tunnel(udid)]
+        _cached = None
+    if closed:
+        print(f"{time.ctime()} device idle for {close_seconds / 60:g} min; closed its tunnel", flush=True)
+    return bool(closed)
+
+
+async def _close_check(close_seconds: float) -> None:
+    """Gate new connections while the tunnel closes, as _idle_check does for
+    WDA: a connection that looked the old tunnel up must not be piped into
+    it as it goes away. Open connections are cut on the phone side."""
+    global _gate
+    if _gate is not None or _healing or time.monotonic() - _last_traffic < close_seconds:
+        return
+    _gate = asyncio.Event()
+    for conn in list(_open):
+        conn.cut_phone_side()
+    try:
+        await asyncio.to_thread(_idle_close, close_seconds)
+    except Exception as exc:  # the relay must outlive a failed close
+        print(f"{time.ctime()} idle tunnel close failed: {exc}", flush=True)
+    finally:
+        _gate.set()
+        _gate = None
+
+
+async def _idle_watch(idle_seconds: float, close_seconds: float = 0.0) -> None:
     while True:
         await asyncio.sleep(_IDLE_CHECK)
-        await _idle_check(idle_seconds)
+        if idle_seconds > 0:
+            await _idle_check(idle_seconds)
+        if close_seconds > 0:
+            await _close_check(close_seconds)
 
 
 async def _idle_check(idle_seconds: float) -> None:
@@ -306,8 +357,10 @@ async def serve() -> None:
         await asyncio.start_server(_handler(DEVICE_MJPEG_PORT), "127.0.0.1", config.MJPEG_PORT),
     ]
     tasks = [s.serve_forever() for s in servers]
-    if config.WDA_IDLE_STOP_MINUTES > 0:
-        tasks.append(_idle_watch(config.WDA_IDLE_STOP_MINUTES * 60))
+    if config.WDA_IDLE_STOP_MINUTES > 0 or config.TUNNEL_IDLE_CLOSE_MINUTES > 0:
+        tasks.append(
+            _idle_watch(config.WDA_IDLE_STOP_MINUTES * 60, config.TUNNEL_IDLE_CLOSE_MINUTES * 60)
+        )
     await asyncio.gather(*tasks)
 
 
