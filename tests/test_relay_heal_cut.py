@@ -60,7 +60,7 @@ def relay_to_fake_wda(tmp_path, monkeypatch):
     monkeypatch.setattr(relay, "_tunnel_address", lookup)
     monkeypatch.setattr(relay, "_maybe_heal", lambda: heals.append(1))
     monkeypatch.setattr(relay, "_open", set())
-    monkeypatch.setattr(relay, "_QUIET_CHECK", 0.0)  # every request checks its tunnel
+    monkeypatch.setattr(relay, "_QUIET_CHECK", -1.0)  # every request checks (a 15.6 ms clock can read 0)
     monkeypatch.setattr(relay, "_LOOKUP_TTL", 0.0)
     loop = asyncio.new_event_loop()
     holder = {}
