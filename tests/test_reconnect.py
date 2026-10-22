@@ -226,11 +226,30 @@ def test_a_gesture_first_after_the_switch_resends_only_the_session_mint(cutting_
 
 def test_a_read_that_keeps_breaking_gives_up_at_the_wait(cutting_wda):
     _HangUpThenAnswer.cut = 10**6
-    c = WDAClient(base_url=cutting_wda, reconnect_wait=0.5)
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=1.0)
     t0 = time.monotonic()
     with pytest.raises(WDAUnreachable):
         c.status()
-    assert time.monotonic() - t0 < 3
+    assert time.monotonic() - t0 < 4
+    assert len(_HangUpThenAnswer.seen) >= 3  # it kept sending until the wait ran out
+
+
+def test_an_element_lookup_whose_connection_broke_is_sent_again(cutting_wda):
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=5)
+    c._request("POST", "/session/S1/elements", {"using": "class chain", "value": "**/X"})
+    assert [p for _, p in _HangUpThenAnswer.seen] == ["/session/S1/elements"] * 2
+
+
+def test_a_gesture_whose_connection_broke_is_never_sent_again(cutting_wda):
+    """No mint first (a gesture landed moments ago), so the tap itself meets
+    the broken connection: whether it landed is unknown, so it is not resent."""
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=5)
+    c.session_id = "S1"
+    c._last_gesture_ok = time.monotonic()
+    with pytest.raises(WDAError) as info:
+        c.tap(10, 10)
+    assert not isinstance(info.value, WDAUnreachable)
+    assert [p for _, p in _HangUpThenAnswer.seen] == ["/session/S1/actions"]
 
 
 def test_a_probe_read_whose_connection_broke_still_fails_fast(cutting_wda):

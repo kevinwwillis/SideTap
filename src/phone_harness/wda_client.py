@@ -67,10 +67,23 @@ def _never_connected(exc: requests.RequestException) -> bool:
 
 
 def _resendable(method: str, path: str) -> bool:
-    """Requests that move nothing on the phone: reads, and minting a session
-    (the first step of a gesture after 30 s idle). A minted session that did
-    land is simply replaced by the next mint, which publishes its own id."""
-    return method == "GET" or (method == "POST" and path == "/session")
+    """Requests that move nothing on the phone: reads, an element lookup (a
+    read sent as a POST), and minting a session (the first step of a gesture
+    after 30 s idle). A minted session that did land is simply replaced by the
+    next mint, which publishes its own id."""
+    if method == "GET":
+        return True
+    return method == "POST" and (path == "/session" or path.endswith("/elements"))
+
+
+def _connection_dropped(exc: requests.RequestException) -> bool:
+    """The connection broke under the request (reset, closed, body cut short),
+    as opposed to a proxy or TLS failure that a resend cannot fix."""
+    if isinstance(exc, requests.exceptions.ChunkedEncodingError):
+        return True
+    if not isinstance(exc, requests.ConnectionError) or not exc.args:
+        return False
+    return isinstance(exc.args[0], urllib3.exceptions.ProtocolError)
 
 
 def _start_relay() -> None:
@@ -392,9 +405,7 @@ class WDAClient:
             )
             if _never_connected(exc):
                 raise WDAUnreachable(msg, nothing_listening=True) from exc
-            if _resendable(method, path) and isinstance(
-                exc, (requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
-            ):
+            if _resendable(method, path) and _connection_dropped(exc):
                 # The first call after a USB/Wi-Fi switch goes out on the pooled
                 # connection to the WDA that just vanished, hangs ~20 s and
                 # breaks (seen live 2026-10-22). A read or a session mint moves
