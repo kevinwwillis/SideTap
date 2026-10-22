@@ -61,7 +61,7 @@ GO_IOS_AGENT_PORT = get("GO_IOS_AGENT_PORT", "28100") or "28100"
 # The Windows scheduled task that runs `pymobiledevice3 remote tunneld` with
 # admin rights (it creates TUN interfaces). device.start_tunnel() starts it
 # when tunneld is not answering.
-TUNNELD_TASK = get("TUNNELD_TASK", "iPad tunneld") or "iPad tunneld"
+TUNNELD_TASK = get("TUNNELD_TASK", "SideTap tunneld") or "SideTap tunneld"
 
 
 # Optional overrides

@@ -76,7 +76,7 @@ def _resendable(method: str, path: str) -> bool:
 def _start_relay() -> None:
     """Start the loopback relay (device.start_forwards), which then brings WDA
     up through its own self-heal. Nothing starts the relay at logon, so after
-    a reboot the first agent call would otherwise fail (TASK-001.15). Lazy
+    a reboot the first agent call would otherwise fail. Lazy
     import: device pulls in go-ios, which this module otherwise avoids."""
     from . import device
 

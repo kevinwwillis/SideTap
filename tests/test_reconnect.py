@@ -1,4 +1,4 @@
-"""Agent calls ride out a WDA restart; health probes still fail fast (TASK-001.11)."""
+"""Agent calls ride out a WDA restart; health probes still fail fast."""
 
 import asyncio
 import json
@@ -273,7 +273,7 @@ def relay_port(monkeypatch):
 
 
 def test_agent_call_starts_a_relay_that_is_not_running(relay_port, monkeypatch):
-    """After a reboot nothing starts the relay (TASK-001.15); the first agent call does."""
+    """After a reboot nothing starts the relay; the first agent call does."""
     port, servers = relay_port
     starts = []
 

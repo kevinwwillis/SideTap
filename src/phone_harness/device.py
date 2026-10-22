@@ -134,7 +134,7 @@ def _link(fn, *args):
 
     When tunneld itself is not answering, start it and try once more: device
     calls (app list, open apps, kill) reach the phone without the relay, so the
-    relay's self-heal never sees them (TASK-001.17)."""
+    relay's self-heal never sees them."""
     try:
         return fn(*args)
     except link.TunneldDown as exc:
@@ -383,8 +383,8 @@ def mark_wda_idle() -> None:
 def release_wda() -> bool:
     """Stop WDA now because the agent is done, as the idle stop would later.
 
-    iOS shows "Automation Running" and dims the screen for as long as WDA runs
-    (Kevin, 2026-10-20: "when you're done, you need to break the link"). The
+    iOS shows "Automation Running" and dims the screen for as long as WDA runs, so an
+    agent that is done should end it rather than wait for the idle stop. The
     relay stays up and WDA is marked idle, so doctor stays green and the next
     call through the relay starts WDA again. Returns False when it was not
     running."""
@@ -408,7 +408,7 @@ def wda_lifecycle_lock():
 def relay_start_lock():
     """Held, across processes, while the relay is checked and started.
 
-    Agent clients start a relay they find missing (TASK-001.15); two at once
+    Agent clients start a relay they find missing; two at once
     would both spawn one, and the loser of the port bind could own relay.pid
     while the winner runs unrecorded, out of reach of `down`."""
     return _file_lock("relay-start.lock")
@@ -465,7 +465,7 @@ _LOG_KEEP = 1024 * 1024  # bytes of a spawned process's log kept across restarts
 
 def _open_log(name: str):
     """A spawned process's log, opened for appending: the end of the previous
-    run's log is the only record of how it stopped (TASK-001.15). Cut back to
+    run's log is the only record of how it stopped. Cut back to
     its last _LOG_KEEP bytes, then marked with this start. Never cut while an
     earlier run still writes it: on Windows its handle keeps the old offset
     and fills the gap with NUL bytes."""
@@ -820,7 +820,7 @@ def _free_port(port: int) -> None:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         # Only a go-ios forwarder on this port: agent calls now reach this
-        # path on their own (TASK-001.15), so an ios.exe doing anything else
+        # path on their own, so an ios.exe doing anything else
         # (another session's tunnel, a syslog) is never killed by name alone.
         cmd = _pid_cmdline(int(pid)) if pid.isdigit() else ""
         if "ios.exe" in info.stdout.lower() and " forward" in cmd and str(port) in cmd:

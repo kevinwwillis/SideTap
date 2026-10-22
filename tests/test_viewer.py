@@ -2651,7 +2651,7 @@ def test_photos_worker_never_stays_running_on_a_crash(monkeypatch):
 
 def test_heal_loop_rests_while_no_page_is_open(monkeypatch):
     """Probes are relay traffic; with no page open they would keep WDA (and the
-    "Automation Running" banner) up forever (TASK-001.13)."""
+    "Automation Running" banner) up forever."""
     monkeypatch.setitem(viewer._BROWSER, "last", 0.0)
     sleeps = []
 

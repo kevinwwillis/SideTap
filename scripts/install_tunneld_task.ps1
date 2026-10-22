@@ -1,16 +1,16 @@
-# Registers the "iPad tunneld" scheduled task: pymobiledevice3's tunneld (scripts\tunneld.pyw),
+# Registers the "SideTap tunneld" scheduled task: pymobiledevice3's tunneld (scripts\tunneld.pyw),
 # with no window and admin rights (it creates TUN interfaces), started at logon and restarted
 # every minute if it stops. tunneld keeps the tunnel to the phone over USB or Wi-Fi.
 # Run from an admin PowerShell; re-running replaces the task.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_tunneld_task.ps1 -Python <python.exe>
 # -Python is the interpreter SideTap's packages are installed in (pythonw.exe next to it runs the task).
-# -TaskName matches TUNNELD_TASK in .env (default "iPad tunneld").
+# -TaskName matches TUNNELD_TASK in .env (default "SideTap tunneld").
 # -LogDir holds tunneld.log. It and the task's working directory stay outside the app folder,
 # so the running task never blocks the installer from replacing that folder.
 
 param(
     [Parameter(Mandatory = $true)][string]$Python,
-    [string]$TaskName = 'iPad tunneld',
+    [string]$TaskName = 'SideTap tunneld',
     [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'SideTap\tunneld'),
     [switch]$NoStart
 )

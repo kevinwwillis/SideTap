@@ -111,7 +111,7 @@ def request_tunnel(udid: str, timeout: float = 15.0) -> str | None:
 
     Returns None when tunneld has a tunnel, else why not. tunneld runs with
     --no-wifi (scripts/tunneld.pyw), so a Wi-Fi tunnel exists only once asked
-    for here: its Wi-Fi monitor kept waking a sleeping iPad (TASK-001.18). Each
+    for here: its Wi-Fi monitor kept waking a sleeping iPad. Each
     link is asked for by name, USB first: an untyped request tries usbmux first,
     and when the device is not on USB that attempt fails with an error tunneld
     does not catch, so Wi-Fi is never tried (pymobiledevice3 11.36.0). Asking
