@@ -1,6 +1,7 @@
 """Agent calls ride out a WDA restart; health probes still fail fast (TASK-001.11)."""
 
 import asyncio
+import json
 import socket
 import sys
 import threading
@@ -162,53 +163,90 @@ def test_a_call_that_reached_wda_is_never_replayed(inside_old_refusal):
 
 
 class _HangUpThenAnswer(BaseHTTPRequestHandler):
-    """The first read is cut after it was sent (the pooled connection to a WDA
-    that vanished in a USB/Wi-Fi switch); later reads are answered."""
+    """The first `cut` requests are cut after they were sent (the pooled
+    connection to a WDA that vanished in a USB/Wi-Fi switch); later ones are
+    answered like WDA would."""
 
     def log_message(self, *args):  # noqa: vulture
         pass
 
-    def do_GET(self):  # noqa: vulture
-        _HangUpThenAnswer.seen += 1
-        if _HangUpThenAnswer.seen == 1:
+    def _cut_or_answer(self, value) -> None:
+        _HangUpThenAnswer.seen.append((self.command, self.path))
+        if len(_HangUpThenAnswer.seen) <= _HangUpThenAnswer.cut:
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
             return
-        body = b'{"value": {"bundleId": "com.apple.Preferences"}}'
+        body = json.dumps({"value": value}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    seen = 0
+    def do_GET(self):  # noqa: vulture
+        self._cut_or_answer({"bundleId": "com.apple.Preferences"})
+
+    def do_POST(self):  # noqa: vulture
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._cut_or_answer({"sessionId": "S1"} if self.path == "/session" else None)
+
+    seen: list = []
+    cut = 1
 
 
-def test_a_read_whose_connection_broke_is_sent_again():
+@pytest.fixture
+def cutting_wda():
+    _HangUpThenAnswer.seen = []
+    _HangUpThenAnswer.cut = 1
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUpThenAnswer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+
+
+def test_a_read_whose_connection_broke_is_sent_again(cutting_wda):
     """Seen live 2026-10-22: the first agent call after a Wi-Fi-to-USB switch
     is a read on the pooled connection to the vanished WDA. A read changes
     nothing on the phone, so the agent client sends it again."""
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUpThenAnswer)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        _HangUpThenAnswer.seen = 0
-        c = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", reconnect_wait=5)
-        assert c._request("GET", "/wda/activeAppInfo") == {"bundleId": "com.apple.Preferences"}
-        assert _HangUpThenAnswer.seen == 2
-    finally:
-        server.shutdown()
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=5)
+    assert c._request("GET", "/wda/activeAppInfo") == {"bundleId": "com.apple.Preferences"}
+    assert len(_HangUpThenAnswer.seen) == 2
 
 
-def test_a_probe_read_whose_connection_broke_still_fails_fast():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUpThenAnswer)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        _HangUpThenAnswer.seen = 0
-        c = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", timeout=5)
-        assert c.link_state() == "down"
-        assert _HangUpThenAnswer.seen == 1
-    finally:
-        server.shutdown()
+def test_a_gesture_first_after_the_switch_resends_only_the_session_mint(cutting_wda):
+    """A gesture after 30 s idle mints a session first; that mint is what meets
+    the broken connection, and it moves nothing, so it is resent. The gesture
+    itself goes out exactly once."""
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=5)
+    c.tap(10, 10)
+    paths = [p for _, p in _HangUpThenAnswer.seen]
+    assert paths[:2] == ["/session", "/session"]
+    assert paths.count("/session/S1/actions") == 1
+
+
+def test_a_read_that_keeps_breaking_gives_up_at_the_wait(cutting_wda):
+    _HangUpThenAnswer.cut = 10**6
+    c = WDAClient(base_url=cutting_wda, reconnect_wait=0.5)
+    t0 = time.monotonic()
+    with pytest.raises(WDAUnreachable):
+        c.status()
+    assert time.monotonic() - t0 < 3
+
+
+def test_a_probe_read_whose_connection_broke_still_fails_fast(cutting_wda):
+    c = WDAClient(base_url=cutting_wda, timeout=5)
+    assert c.link_state() == "down"
+    assert len(_HangUpThenAnswer.seen) == 1
+
+
+def test_a_request_error_that_is_not_a_broken_connection_is_not_retried():
+    """A bad address cannot heal, so it fails at once instead of after the wait."""
+    c = WDAClient(base_url="127.0.0.1:1", reconnect_wait=30)
+    t0 = time.monotonic()
+    with pytest.raises(WDAError) as info:
+        c.status()
+    assert not isinstance(info.value, WDAUnreachable)
+    assert time.monotonic() - t0 < 3
 
 
 class _Ok(BaseHTTPRequestHandler):

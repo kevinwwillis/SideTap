@@ -35,8 +35,8 @@ class WDATimeout(WDAError):
 class WDAUnreachable(WDAError):
     """Safe to send again: the request never reached WDA (the relay's marked
     503, or nothing listened on the relay port), so nothing acted, gestures
-    included; or it was a read (GET) whose connection broke, and a read
-    changes nothing on the phone."""
+    included; or its connection broke and it moves nothing on the phone (a
+    read, or minting a session: `_resendable`)."""
 
     def __init__(self, *args, nothing_listening: bool = False):
         super().__init__(*args)
@@ -64,6 +64,13 @@ def _never_connected(exc: requests.RequestException) -> bool:
     inner = exc.args[0]
     reason = getattr(inner, "reason", inner)
     return isinstance(reason, urllib3.exceptions.NewConnectionError)
+
+
+def _resendable(method: str, path: str) -> bool:
+    """Requests that move nothing on the phone: reads, and minting a session
+    (the first step of a gesture after 30 s idle). A minted session that did
+    land is simply replaced by the next mint, which publishes its own id."""
+    return method == "GET" or (method == "POST" and path == "/session")
 
 
 def _start_relay() -> None:
@@ -385,11 +392,13 @@ class WDAClient:
             )
             if _never_connected(exc):
                 raise WDAUnreachable(msg, nothing_listening=True) from exc
-            if method == "GET":
-                # A read changes nothing on the phone, so one whose connection
-                # broke is safe to send again. The first read after a USB/Wi-Fi
-                # switch goes out on the pooled connection to the WDA that just
-                # vanished, hangs ~20 s and breaks (seen live 2026-10-22).
+            if _resendable(method, path) and isinstance(
+                exc, (requests.ConnectionError, requests.exceptions.ChunkedEncodingError)
+            ):
+                # The first call after a USB/Wi-Fi switch goes out on the pooled
+                # connection to the WDA that just vanished, hangs ~20 s and
+                # breaks (seen live 2026-10-22). A read or a session mint moves
+                # nothing on the phone, so it is safe to send again.
                 raise WDAUnreachable(msg) from exc
             raise WDAError(msg) from exc
         if resp.headers.get(UNREACHABLE_HEADER) == "unreachable":
