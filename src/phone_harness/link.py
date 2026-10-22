@@ -6,7 +6,8 @@ found` even with --address/--rsd-port). pymobiledevice3's `remote tunneld` keeps
 one tunnel per device over whichever link exists (USB or Wi-Fi) and lists them on
 a local HTTP API; every call here connects to the device's RemoteServiceDiscovery
 (RSD) endpoint through that tunnel. tunneld itself runs as its own long-lived
-admin process (it creates TUN interfaces); this module never starts it.
+admin process (it creates TUN interfaces); this module never starts it, but
+says when it is down (TunneldDown) so the relay's self-heal can.
 
 The calls are in-process (import ~1.4 s once, connect ~0.45 s, app list ~0.22 s
 measured over Wi-Fi) rather than one `python -m pymobiledevice3` per call (3-7 s).
@@ -35,17 +36,26 @@ class LinkError(RuntimeError):
     pass
 
 
+class TunneldDown(LinkError):
+    """tunneld itself is not answering on its local API.
+
+    Kept apart from the other LinkErrors ("no tunnel to the phone"), because
+    the repair differs: a stopped tunneld is restarted (its scheduled task),
+    while a phone that is away needs nothing from this PC."""
+
+
 def tunnels(timeout: float = 3.0) -> dict[str, list[dict]]:
     """tunneld's listing: {udid: [{"tunnel-address", "tunnel-port", "interface", ...}]}.
 
-    Raises LinkError when tunneld itself is not answering, which is a different
-    fault from "no phone": the fix is to start tunneld, not to plug anything in.
+    Raises TunneldDown (a LinkError) when tunneld itself is not answering, which
+    is a different fault from "no phone": the fix is to start tunneld, not to
+    plug anything in.
     """
     try:
         with urllib.request.urlopen(TUNNELD_URL + "/", timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise LinkError(f"tunneld is not answering at {TUNNELD_URL}: {exc}") from exc
+        raise TunneldDown(f"tunneld is not answering at {TUNNELD_URL}: {exc}") from exc
     return {udid: list(entries or []) for udid, entries in (data or {}).items() if entries}
 
 
