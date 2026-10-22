@@ -406,9 +406,10 @@ class WDAClient:
             if _never_connected(exc):
                 raise WDAUnreachable(msg, nothing_listening=True) from exc
             if _resendable(method, path) and _connection_dropped(exc):
-                # The first call after a USB/Wi-Fi switch goes out on the pooled
-                # connection to the WDA that just vanished, hangs ~20 s and
-                # breaks (seen live 2026-10-22). A read or a session mint moves
+                # Right after a USB/Wi-Fi switch, before tunneld has dropped the
+                # old tunnel, a call can go out on the pooled connection to the
+                # WDA that just vanished, hang ~20 s and break (seen live
+                # 2026-10-22). A read or a session mint moves
                 # nothing on the phone, so it is safe to send again.
                 raise WDAUnreachable(msg) from exc
             raise WDAError(msg) from exc
