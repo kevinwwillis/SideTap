@@ -33,9 +33,10 @@ class WDATimeout(WDAError):
 
 
 class WDAUnreachable(WDAError):
-    """The request never reached WDA: the relay could not connect to it (its
-    marked 503) or nothing listened on the relay port. Replaying is safe for
-    any request, gestures included, because nothing acted."""
+    """Safe to send again: the request never reached WDA (the relay's marked
+    503, or nothing listened on the relay port), so nothing acted, gestures
+    included; or it was a read (GET) whose connection broke, and a read
+    changes nothing on the phone."""
 
     def __init__(self, *args, nothing_listening: bool = False):
         super().__init__(*args)
@@ -384,6 +385,12 @@ class WDAClient:
             )
             if _never_connected(exc):
                 raise WDAUnreachable(msg, nothing_listening=True) from exc
+            if method == "GET":
+                # A read changes nothing on the phone, so one whose connection
+                # broke is safe to send again. The first read after a USB/Wi-Fi
+                # switch goes out on the pooled connection to the WDA that just
+                # vanished, hangs ~20 s and breaks (seen live 2026-10-22).
+                raise WDAUnreachable(msg) from exc
             raise WDAError(msg) from exc
         if resp.headers.get(UNREACHABLE_HEADER) == "unreachable":
             raise WDAUnreachable(

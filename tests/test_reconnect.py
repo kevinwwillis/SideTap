@@ -161,6 +161,56 @@ def test_a_call_that_reached_wda_is_never_replayed(inside_old_refusal):
         server.shutdown()
 
 
+class _HangUpThenAnswer(BaseHTTPRequestHandler):
+    """The first read is cut after it was sent (the pooled connection to a WDA
+    that vanished in a USB/Wi-Fi switch); later reads are answered."""
+
+    def log_message(self, *args):  # noqa: vulture
+        pass
+
+    def do_GET(self):  # noqa: vulture
+        _HangUpThenAnswer.seen += 1
+        if _HangUpThenAnswer.seen == 1:
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        body = b'{"value": {"bundleId": "com.apple.Preferences"}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    seen = 0
+
+
+def test_a_read_whose_connection_broke_is_sent_again():
+    """Seen live 2026-10-22: the first agent call after a Wi-Fi-to-USB switch
+    is a read on the pooled connection to the vanished WDA. A read changes
+    nothing on the phone, so the agent client sends it again."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUpThenAnswer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        _HangUpThenAnswer.seen = 0
+        c = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", reconnect_wait=5)
+        assert c._request("GET", "/wda/activeAppInfo") == {"bundleId": "com.apple.Preferences"}
+        assert _HangUpThenAnswer.seen == 2
+    finally:
+        server.shutdown()
+
+
+def test_a_probe_read_whose_connection_broke_still_fails_fast():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HangUpThenAnswer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        _HangUpThenAnswer.seen = 0
+        c = WDAClient(base_url=f"http://127.0.0.1:{server.server_port}", timeout=5)
+        assert c.link_state() == "down"
+        assert _HangUpThenAnswer.seen == 1
+    finally:
+        server.shutdown()
+
+
 class _Ok(BaseHTTPRequestHandler):
     def log_message(self, *args):  # noqa: vulture
         pass
