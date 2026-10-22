@@ -90,31 +90,50 @@ def _known_udids() -> list[str]:
 _UNREACHABLE = "unreachable"  # request_tunnel(): tunneld found no way to the device
 
 
+_REQUEST_TYPES = ("usbmux", "wifi")  # the links request_tunnel() tries, USB first
+# What tunneld answers when the device is not on the link asked for: its own
+# "no task" reply, or usbmux's DeviceNotFoundError, which escapes its handler.
+_NOT_ON_LINK = {"task not created", "DeviceNotFoundError"}
+
+
 def request_tunnel(udid: str, timeout: float = 15.0) -> str | None:
     """Ask tunneld to build a tunnel to `udid` now (its /start-tunnel API).
 
-    Returns None when tunneld has a tunnel, else why not. tunneld's own monitors
-    miss one case: a device that was attached by USB while it already had a
-    Wi-Fi tunnel is never revisited when that tunnel drops, because the USB
-    monitor only acts on attach events (doronz88/pymobiledevice3#2052). Asking is cheap when a
-    tunnel exists (tunneld returns it) and fails fast otherwise.
+    Returns None when tunneld has a tunnel, else why not. tunneld runs with
+    --no-wifi (scripts/tunneld.pyw), so a Wi-Fi tunnel exists only once asked
+    for here: its Wi-Fi monitor kept waking a sleeping iPad (TASK-001.18). Each
+    link is asked for by name, USB first: an untyped request tries usbmux first,
+    and when the device is not on USB that attempt fails with an error tunneld
+    does not catch, so Wi-Fi is never tried (pymobiledevice3 11.36.0). Asking
+    also covers the USB case tunneld's own monitor misses: a device attached
+    while it had a Wi-Fi tunnel is never revisited when that tunnel drops
+    (doronz88/pymobiledevice3#2052). Asking is cheap when a tunnel exists
+    (tunneld returns it) and fails fast otherwise.
     """
-    url = f"{TUNNELD_URL}/start-tunnel?udid={urllib.parse.quote(udid)}"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout):
-            return None
-    except urllib.error.HTTPError as exc:
+    failures: list[str] = []
+    for link_type in _REQUEST_TYPES:
+        url = (
+            f"{TUNNELD_URL}/start-tunnel?udid={urllib.parse.quote(udid)}"
+            f"&connection_type={link_type}"
+        )
         try:
-            error = json.loads(exc.read().decode("utf-8")).get("error")
-        except (ValueError, AttributeError, OSError):
-            error = None
-        if error == "task not created":
-            return _UNREACHABLE  # tunneld found no way to the device: the usual no-phone case
-        if isinstance(error, dict):
-            error = error.get("exception")
-        return f"tunneld's tunnel request failed: HTTP {exc.code} {error or exc.reason}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        return f"tunneld's tunnel request failed: {exc}"
+            with urllib.request.urlopen(url, timeout=timeout):
+                return None
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.loads(exc.read().decode("utf-8")).get("error")
+            except (ValueError, AttributeError, OSError):
+                error = None
+            if isinstance(error, dict):
+                error = error.get("exception")
+            if error in _NOT_ON_LINK:
+                continue  # not on this link: the usual case, try the next one
+            failures.append(
+                f"tunneld's {link_type} tunnel request failed: HTTP {exc.code} {error or exc.reason}"
+            )
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            failures.append(f"tunneld's {link_type} tunnel request failed: {exc}")
+    return "; ".join(failures) if failures else _UNREACHABLE
 
 
 def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:

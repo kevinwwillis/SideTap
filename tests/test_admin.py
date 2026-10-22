@@ -478,3 +478,18 @@ def test_up_moves_an_older_go_ios_link_to_the_tunnel(monkeypatch, capsys):
     assert stopped == [admin.device.LEGACY_PROCS]
     assert started == ["com.x.wda"] and forwards == [True]
     assert "older link" in capsys.readouterr().out
+
+
+def test_device_check_asks_for_a_tunnel_before_reading_the_listing(monkeypatch):
+    # tunneld runs with --no-wifi: a Wi-Fi iPad is listed only after a request.
+    calls = []
+
+    def tunnel_for(udid=None):
+        calls.append("request")
+        return ("fd59::1", 51392, "wifi")
+
+    monkeypatch.setattr(admin.device.link, "tunnel_for", tunnel_for)
+    monkeypatch.setattr(admin.device, "list_devices", lambda: calls.append("list") or ["UDID"])
+    ok, detail, _ = admin._check_device()
+    assert ok and "wifi" in detail
+    assert calls[:2] == ["request", "list"]

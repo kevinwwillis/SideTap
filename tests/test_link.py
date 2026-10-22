@@ -1,6 +1,7 @@
 """link.py (tunneld lookup) and relay.py (loopback relay). No phone needed."""
 
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
@@ -201,7 +202,53 @@ def test_no_tunnel_asks_tunneld_for_one(monkeypatch):
     monkeypatch.setattr(link, "_last_request", -1e9)
     monkeypatch.setattr(link, "_known_udids", lambda: [UDID])
     assert link.tunnel_for() == ("fd11::1", 50001, "usb")
-    assert asked == [link.TUNNELD_URL + "/start-tunnel?udid=" + UDID]
+    assert asked == [link.TUNNELD_URL + "/start-tunnel?udid=" + UDID + "&connection_type=usbmux"]
+
+
+def _not_on_usb(url):
+    # What tunneld answers for connection_type=usbmux when the phone is not on
+    # USB: its DeviceNotFoundError escapes the handler as a 501 (2026-10-22).
+    body = json.dumps({"error": {"exception": "DeviceNotFoundError", "traceback": "..."}}).encode()
+    return link.urllib.error.HTTPError(url, 501, "Not Implemented", {}, io.BytesIO(body))
+
+
+def test_no_usb_tunnel_asks_for_a_wifi_one(monkeypatch):
+    # tunneld runs with --no-wifi, so a Wi-Fi tunnel exists only once asked for,
+    # and an untyped request dies on the USB attempt before it ever tries Wi-Fi.
+    listings = iter([{}, {UDID: [WIFI]}])
+    asked = []
+
+    def urlopen(url, timeout=3.0):
+        if "/start-tunnel" in url:
+            asked.append(url.rsplit("connection_type=", 1)[-1])
+            if url.endswith("usbmux"):
+                raise _not_on_usb(url)
+            r = _Resp({})
+            r.status = 200
+            return r
+        return _Resp(next(listings))
+
+    monkeypatch.setattr(link.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(link, "_last_request", -1e9)
+    assert link.tunnel_for(UDID)[2] == "wifi"
+    assert asked == ["usbmux", "wifi"]
+
+
+def test_phone_on_neither_link_is_reported_as_away(monkeypatch):
+    def urlopen(url, timeout=3.0):
+        if "/start-tunnel" in url:
+            if url.endswith("usbmux"):
+                raise _not_on_usb(url)
+            raise link.urllib.error.HTTPError(
+                url, 501, "Not Implemented", {}, io.BytesIO(b'{"error": "task not created"}')
+            )
+        return _Resp({})
+
+    monkeypatch.setattr(link.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(link, "_last_request", -1e9)
+    with pytest.raises(link.LinkError) as err:
+        link.tunnel_for(UDID)
+    assert "request failed" not in str(err.value)
 
 
 def test_tunnel_requests_are_rate_limited(monkeypatch):
@@ -219,7 +266,7 @@ def test_tunnel_requests_are_rate_limited(monkeypatch):
     for _ in range(3):
         with pytest.raises(link.LinkError, match="no tunnel to the phone"):
             link.tunnel_for()
-    assert len(asked) == 1  # one request per interval, not one per connection
+    assert len(asked) == len(link._REQUEST_TYPES)  # one round per interval, not one per connection
 
 
 def test_tunnel_request_failure_is_named(monkeypatch):
