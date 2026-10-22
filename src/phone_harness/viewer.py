@@ -250,7 +250,12 @@ def _syslog_loop() -> None:
     """
     while True:
         try:
-            syslog.start()
+            # Only while a page is open, like the watchdog: the stream is
+            # traffic to the iPad, which must stay quiet when nobody works.
+            if _watched():
+                syslog.start()
+            else:
+                syslog.stop()
         except Exception:
             pass  # a debugging aid must never take the viewer down
         time.sleep(_SYSLOG_POLL)
