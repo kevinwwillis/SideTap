@@ -169,7 +169,7 @@ def up_env(monkeypatch):
     Returns (schtasks commands run, tunneld state). The heal stops right after
     the tunnel step (the device check fails), which is all this path needs."""
     runs = []
-    state = {"tunneld_up": False}
+    state = {"tunneld_up": False, "task": "Ready"}
 
     class DownClient:
         def __init__(self, *a, **k):
@@ -184,11 +184,20 @@ def up_env(monkeypatch):
     monkeypatch.setattr(device.link, "tunneld_up", lambda timeout=3.0: state["tunneld_up"])
 
     def schtasks(cmd, **kw):
-        runs.append(cmd)
-        state["tunneld_up"] = True  # the task started tunneld
+        out = ""
+        if "/Query" in cmd:
+            task, status = device.config.TUNNELD_TASK, state["task"]
+            out = '"' + task + '","N/A","' + status + '"'
+        else:
+            runs.append(cmd)
+        if "/End" in cmd:
+            state["task"] = "Ready"
+        if "/Run" in cmd and state["task"] != "Running":
+            state["tunneld_up"] = True  # the task started tunneld
+            state["task"] = "Running"
 
         class P:
-            returncode, stdout, stderr = 0, "", ""
+            returncode, stdout, stderr = 0, out, ""
 
         return P()
 
@@ -221,4 +230,52 @@ def test_the_heal_leaves_a_tunneld_that_answers_again_alone(up_env, monkeypatch)
     monkeypatch.setattr(device.time, "monotonic", tick)
     monkeypatch.setattr(device.link, "tunnel_for", lambda udid=None: ("fd00::1", 5000, "usb"))
     relay._heal()
+    assert runs == []
+
+
+def test_a_hung_tunneld_is_ended_then_started(up_env):
+    # The task runs but its API never answers: /Run alone does nothing under
+    # MultipleInstances IgnoreNew, so the heal ends the task first.
+    runs, state = up_env
+    state["task"] = "Running"
+    relay._heal()
+    task = device.config.TUNNELD_TASK
+    assert runs == [["schtasks", "/End", "/TN", task], ["schtasks", "/Run", "/TN", task]]
+
+
+def test_a_slow_tunneld_that_answers_the_longer_probe_is_left_running(up_env, monkeypatch):
+    runs, state = up_env
+    state["task"] = "Running"
+    monkeypatch.setattr(device.link, "tunneld_up", lambda timeout=3.0: timeout > 3.0)
+    device._start_tunneld_task()
+    assert runs == []
+
+
+def test_a_device_call_restarts_a_stopped_tunneld_and_retries(up_env, monkeypatch):
+    # open_apps/close_app/list_apps reach the phone without the relay.
+    runs, state = up_env
+    monkeypatch.setattr(device, "_last_tunneld_restart", -1e9)
+    calls = []
+
+    def running_apps():
+        calls.append(state["tunneld_up"])
+        if not state["tunneld_up"]:
+            raise device.link.TunneldDown("tunneld is not answering")
+        return [{"bundle": "com.apple.Preferences"}]
+
+    monkeypatch.setattr(device.link, "running_apps", running_apps)
+    assert device._link(device.link.running_apps) == [{"bundle": "com.apple.Preferences"}]
+    assert calls == [False, True]
+    assert runs == [["schtasks", "/Run", "/TN", device.config.TUNNELD_TASK]]
+
+
+def test_device_call_restarts_are_rate_limited(up_env, monkeypatch):
+    runs, state = up_env
+    monkeypatch.setattr(device, "_last_tunneld_restart", device.time.monotonic())
+
+    def down():
+        raise device.link.TunneldDown("tunneld is not answering")
+
+    with pytest.raises(device.DeviceError, match="not answering"):
+        device._link(down)
     assert runs == []

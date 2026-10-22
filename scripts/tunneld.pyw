@@ -7,12 +7,14 @@ scripts/install_tunneld_task.ps1 registers, with a log dir outside the app folde
 a running task holding its log or working directory there would block the
 installer from replacing the folder on update.
 tunneld keeps one tunnel per iPad over USB or Wi-Fi and lists them on 127.0.0.1:49151.
-It runs with --no-wifi and --no-mobdev2: neither of its two Wi-Fi monitors runs, so it
-never looks for the iPad on Wi-Fi by itself, and a Wi-Fi tunnel is built only when an agent
-asks for one (phone_harness.link.tunnel_for() calls tunneld's
-/start-tunnel). With them on, tunneld connected to a sleeping iPad every few seconds
-(remote pairing, and lockdown on port 62078); each connection woke it for about 3 s, the tunnel died when it slept again, and the
-Wi-Fi tunnel adapter on this PC came and went about once a minute (TASK-001.18,
+It runs with --no-wifi --no-mobdev2 --no-usb: neither of its two Wi-Fi monitors runs, nor
+its USB network-interface monitor (CDC-NCM, which repeats a Bonjour browse); on Windows USB
+tunnels come from its usbmux monitor, which stays on. So it never looks for the iPad on
+Wi-Fi by itself, and a Wi-Fi tunnel is built only when an agent asks for one
+(phone_harness.link.request_tunnel() calls tunneld's /start-tunnel). With the Wi-Fi monitors
+on, tunneld connected to a sleeping iPad every few seconds (remote pairing, and lockdown on
+port 62078); each connection woke it for about 3 s, the tunnel died when it slept again, and
+the Wi-Fi tunnel adapter on this PC came and went about once a minute (TASK-001.18,
 docs/connection.md "A sleeping iPad on Wi-Fi").
 pythonw has no console, so stdout and stderr go to a log file that is cut back to
 its last 2 MB at each start.
@@ -53,5 +55,5 @@ uvicorn.run = _run_with_policy_loop
 
 from pymobiledevice3.__main__ import main  # noqa: E402
 
-sys.argv = ["pymobiledevice3", "remote", "tunneld", "--no-wifi", "--no-mobdev2"]
+sys.argv = ["pymobiledevice3", "remote", "tunneld", "--no-wifi", "--no-mobdev2", "--no-usb"]
 sys.exit(main())
