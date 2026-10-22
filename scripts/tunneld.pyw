@@ -2,7 +2,7 @@
 
     pythonw scripts/tunneld.pyw [<log dir>]     (default: .state/ next to scripts/)
 
-Started by the "iPad tunneld" scheduled task (admin, at logon) that
+Started by the "SideTap tunneld" scheduled task (admin, at logon) that
 scripts/install_tunneld_task.ps1 registers, with a log dir outside the app folder:
 a running task holding its log or working directory there would block the
 installer from replacing the folder on update.
@@ -14,8 +14,7 @@ Wi-Fi by itself, and a Wi-Fi tunnel is built only when an agent asks for one
 (phone_harness.link.request_tunnel() calls tunneld's /start-tunnel). With the Wi-Fi monitors
 on, tunneld connected to a sleeping iPad every few seconds (remote pairing, and lockdown on
 port 62078); each connection woke it for about 3 s, the tunnel died when it slept again, and
-the Wi-Fi tunnel adapter on this PC came and went about once a minute (TASK-001.18,
-docs/connection.md "A sleeping iPad on Wi-Fi").
+the Wi-Fi tunnel adapter on this PC came and went about once a minute.
 pythonw has no console, so stdout and stderr go to a log file that is cut back to
 its last 2 MB at each start.
 

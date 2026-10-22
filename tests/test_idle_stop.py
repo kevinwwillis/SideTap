@@ -1,4 +1,4 @@
-"""The relay stops an idle WDA so iOS drops its "Automation Running" banner (TASK-001.13)."""
+"""The relay stops an idle WDA so iOS drops its "Automation Running" banner."""
 
 import asyncio
 import sys
@@ -304,7 +304,7 @@ def test_a_request_on_a_pooled_connection_after_the_cut_is_marked_unreachable(
 
 
 def test_stop_link_stops_wda_and_marks_it_idle(runner):
-    """Agents end their automation at once (TASK-001.16): banner gone, doctor green."""
+    """Agents end their automation at once: banner gone, doctor green."""
     from phone_harness import helpers
 
     assert helpers.stop_link() == "stopped"

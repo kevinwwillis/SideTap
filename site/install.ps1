@@ -8,7 +8,7 @@
 #   3. Installs the Python packages SideTap needs (requirements.txt).
 #   4. Downloads go-ios (the USB phone tool) — no Node.js needed.
 #   5. Installs the Apple Devices app (USB driver) if it is missing.
-#   6. Registers the "iPad tunneld" logon task (one admin prompt): it keeps the
+#   6. Registers the "SideTap tunneld" logon task (one admin prompt): it keeps the
 #      tunnel to the phone over USB or Wi-Fi.
 #   7. Puts a SideTap shortcut on the Desktop and Start Menu.
 #

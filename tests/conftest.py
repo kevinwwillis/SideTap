@@ -4,7 +4,7 @@ On a machine that drives a phone, the relay (WDA_PORT, MJPEG_PORT) and tunneld
 (49151) are live on loopback, and a test that forgets to stub one of them
 starts WebDriverAgent on the real device: its "Automation Running" banner, a
 tunnel built to a sleeping iPad. Seen 2026-10-22: five viewer tests reached
-both (TASK-001.18). Connections to those ports are refused for the whole run,
+both. Connections to those ports are refused for the whole run,
 so such a test sees what it would see on a machine with no phone.
 """
 

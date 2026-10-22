@@ -33,9 +33,10 @@ class WDATimeout(WDAError):
 
 
 class WDAUnreachable(WDAError):
-    """The request never reached WDA: the relay could not connect to it (its
-    marked 503) or nothing listened on the relay port. Replaying is safe for
-    any request, gestures included, because nothing acted."""
+    """Safe to send again: the request never reached WDA (the relay's marked
+    503, or nothing listened on the relay port), so nothing acted, gestures
+    included; or its connection broke and it moves nothing on the phone (a
+    read, or minting a session: `_resendable`)."""
 
     def __init__(self, *args, nothing_listening: bool = False):
         super().__init__(*args)
@@ -65,10 +66,30 @@ def _never_connected(exc: requests.RequestException) -> bool:
     return isinstance(reason, urllib3.exceptions.NewConnectionError)
 
 
+def _resendable(method: str, path: str) -> bool:
+    """Requests that move nothing on the phone: reads, an element lookup (a
+    read sent as a POST), and minting a session (the first step of a gesture
+    after 30 s idle). A minted session that did land is simply replaced by the
+    next mint, which publishes its own id."""
+    if method == "GET":
+        return True
+    return method == "POST" and (path == "/session" or path.endswith("/elements"))
+
+
+def _connection_dropped(exc: requests.RequestException) -> bool:
+    """The connection broke under the request (reset, closed, body cut short),
+    as opposed to a proxy or TLS failure that a resend cannot fix."""
+    if isinstance(exc, requests.exceptions.ChunkedEncodingError):
+        return True
+    if not isinstance(exc, requests.ConnectionError) or not exc.args:
+        return False
+    return isinstance(exc.args[0], urllib3.exceptions.ProtocolError)
+
+
 def _start_relay() -> None:
     """Start the loopback relay (device.start_forwards), which then brings WDA
     up through its own self-heal. Nothing starts the relay at logon, so after
-    a reboot the first agent call would otherwise fail (TASK-001.15). Lazy
+    a reboot the first agent call would otherwise fail. Lazy
     import: device pulls in go-ios, which this module otherwise avoids."""
     from . import device
 
@@ -384,6 +405,12 @@ class WDAClient:
             )
             if _never_connected(exc):
                 raise WDAUnreachable(msg, nothing_listening=True) from exc
+            if _resendable(method, path) and _connection_dropped(exc):
+                # The first call after a USB/Wi-Fi switch goes out on the pooled
+                # connection to the WDA that just vanished, hangs ~20 s and
+                # breaks (seen live 2026-10-22). A read or a session mint moves
+                # nothing on the phone, so it is safe to send again.
+                raise WDAUnreachable(msg) from exc
             raise WDAError(msg) from exc
         if resp.headers.get(UNREACHABLE_HEADER) == "unreachable":
             raise WDAUnreachable(

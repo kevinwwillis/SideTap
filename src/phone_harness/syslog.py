@@ -112,7 +112,7 @@ def _close_dump() -> None:
 def stop() -> None:
     """End the capture: the viewer runs it only while one of its pages is open,
     because its stream is traffic to the iPad, and with no agent or person
-    working nothing should reach a sleeping iPad (TASK-001.18)."""
+    working nothing should reach a sleeping iPad."""
     global _proc, _next_attempt
     if _proc is None:
         return

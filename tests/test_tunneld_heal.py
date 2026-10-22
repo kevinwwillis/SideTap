@@ -1,4 +1,4 @@
-"""A stopped tunneld is restarted by the relay's self-heal (TASK-001.17). No phone needed.
+"""A stopped tunneld is restarted by the relay's self-heal. No phone needed.
 
 When tunneld stops, every tunnel lookup fails, so every agent call got the
 relay's marked 503 and the self-heal never ran: it skipped every LinkError,

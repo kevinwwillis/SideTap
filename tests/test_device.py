@@ -513,7 +513,7 @@ def test_stopping_the_relay_spares_the_wda_it_started(tmp_path, monkeypatch):
 
 
 def test_spawn_keeps_the_previous_runs_log(tmp_path, monkeypatch):
-    """A restart must not wipe the log that says how the last run ended (TASK-001.15)."""
+    """A restart must not wipe the log that says how the last run ended."""
     import subprocess as sp
 
     monkeypatch.setattr(device.config, "STATE_DIR", tmp_path)

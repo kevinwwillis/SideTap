@@ -147,7 +147,7 @@ def test_tail_closes_itself(monkeypatch):
 
 
 def test_stop_ends_the_capture_and_lets_the_next_page_restart_it(monkeypatch):
-    # The viewer stops the stream when no page is open (TASK-001.18): it is
+    # The viewer stops the stream when no page is open: it is
     # traffic to the iPad, which must stay quiet while nobody works.
     stopped = []
     monkeypatch.setattr(syslog, "_proc", _FakeProc())
