@@ -1,6 +1,7 @@
-"""When the relay's self-heal starts, pooled connections to the old WDA stop
-being a trap: an idle one answers its next request with the marked 503, and a
-request still waiting on the old phone side fails at once."""
+"""Pooled connections through the relay that lead to a WDA that is gone are
+closed, so a client's next request opens a fresh connection instead of going
+into a dead tunnel and hanging until TCP gives up (~20 s, seen live after a
+USB/Wi-Fi switch)."""
 
 import asyncio
 import sys
@@ -13,14 +14,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from phone_harness import config, relay  # noqa: E402
-from phone_harness.wda_client import WDAClient, WDAError, WDAUnreachable  # noqa: E402
+from phone_harness import config, link, relay  # noqa: E402
+from phone_harness.wda_client import WDAClient, WDAUnreachable  # noqa: E402
 
 
 class _FakeWDA(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive, like WDA
     seen: list = []
-    slow = threading.Event()  # set: the next request waits ~10 s before answering
 
     def log_message(self, *args):  # noqa: vulture
         pass
@@ -28,8 +28,6 @@ class _FakeWDA(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: vulture
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         _FakeWDA.seen.append(self.path)
-        if _FakeWDA.slow.is_set():
-            time.sleep(10)
         body = b'{"value": null}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -40,17 +38,24 @@ class _FakeWDA(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def relay_to_fake_wda(tmp_path, monkeypatch):
+    """The real relay handler in front of a fake WDA. `where["address"]` is
+    what the tunnel lookup answers; an exception there is raised by it."""
     monkeypatch.setattr(config, "STATE_DIR", tmp_path)
     _FakeWDA.seen = []
-    _FakeWDA.slow.clear()
     wda = ThreadingHTTPServer(("127.0.0.1", 0), _FakeWDA)
     wda.daemon_threads = True
     threading.Thread(target=wda.serve_forever, daemon=True).start()
+    where = {"address": "127.0.0.1"}
+
+    def lookup():
+        if isinstance(where["address"], Exception):
+            raise where["address"]
+        return where["address"]
+
+    heals = []
     monkeypatch.setattr(relay, "DEVICE_WDA_PORT", wda.server_port)
-    monkeypatch.setattr(relay, "_tunnel_address", lambda: "127.0.0.1")
-    monkeypatch.setattr(relay, "_heal", lambda: None)  # the repair itself is not under test
-    monkeypatch.setattr(relay, "_healing", False)
-    monkeypatch.setattr(relay, "_heal_started", 0.0)
+    monkeypatch.setattr(relay, "_tunnel_address", lookup)
+    monkeypatch.setattr(relay, "_maybe_heal", lambda: heals.append(1))
     monkeypatch.setattr(relay, "_open", set())
     loop = asyncio.new_event_loop()
     holder = {}
@@ -67,54 +72,108 @@ def relay_to_fake_wda(tmp_path, monkeypatch):
     t = threading.Thread(target=lambda: loop.run_until_complete(run()), daemon=True)
     t.start()
     started.wait(5)
-
-    def start_heal():
-        async def go():
-            relay._maybe_heal()
-
-        asyncio.run_coroutine_threadsafe(go(), loop).result(5)
-
-    yield f"http://127.0.0.1:{holder['port']}", start_heal
+    yield f"http://127.0.0.1:{holder['port']}", where, wda, heals
     loop.call_soon_threadsafe(holder["stop"].set)
     t.join(5)
-    wda.shutdown()
+    try:
+        wda.shutdown()
+    except Exception:
+        pass
 
 
-def test_an_idle_pooled_connection_answers_the_marked_503_after_a_heal_starts(relay_to_fake_wda):
-    url, start_heal = relay_to_fake_wda
-    c = WDAClient(base_url=url, timeout=5)
-    c._request("POST", "/session/x/actions", {})  # opens and pools a connection
-    assert len(relay._open) == 1
-    start_heal()
-    with pytest.raises(WDAUnreachable, match="self-heal"):
-        c._request("POST", "/session/x/actions", {"x": 1})  # same pooled connection
-    assert _FakeWDA.seen == ["/session/x/actions"]  # the second call never reached WDA
-
-
-def test_a_request_waiting_on_the_old_phone_side_fails_at_once(relay_to_fake_wda):
-    url, start_heal = relay_to_fake_wda
-    c = WDAClient(base_url=url, timeout=30)
-    c._request("POST", "/session/x/actions", {})  # pool a connection
-    _FakeWDA.slow.set()
-    result = {}
-
-    def gesture():
-        t0 = time.monotonic()
-        try:
-            c._request("POST", "/session/x/actions", {"x": 1})
-        except WDAError as exc:
-            result["exc"] = exc
-        result["took"] = time.monotonic() - t0
-
-    th = threading.Thread(target=gesture)
-    th.start()
-    deadline = time.monotonic() + 5
-    while len(_FakeWDA.seen) < 2 and time.monotonic() < deadline:
+def _wait_until(cond, timeout: float = 2.0) -> None:
+    """The relay answers the client before it finishes its own bookkeeping."""
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert len(_FakeWDA.seen) == 2  # the gesture reached WDA and waits for its reply
-    start_heal()
-    th.join(10)
-    assert result["took"] < 5  # not the 10 s reply, nor a TCP give-up
-    # It may have acted, so it is a broken call, never the replayable 503.
-    assert isinstance(result["exc"], WDAError)
-    assert not isinstance(result["exc"], WDAUnreachable)
+
+
+def _wait_closed(conn_count: int) -> None:
+    _wait_until(lambda: len(relay._open) <= conn_count)
+
+
+def test_a_pooled_connection_to_an_old_tunnel_is_closed_and_the_next_call_works(
+    relay_to_fake_wda,
+):
+    url, where, _, _ = relay_to_fake_wda
+    agent = WDAClient(base_url=url, timeout=5)
+    agent._request("POST", "/session/x/actions", {})  # pooled, on 127.0.0.1
+    assert len(relay._open) == 1
+    where["address"] = "localhost"  # the link changed (same fake WDA, new name)
+    other = WDAClient(base_url=url, timeout=5)
+    other._request("POST", "/session/x/actions", {"other": 1})  # a new connection sees it
+    _wait_closed(1)
+    assert len(relay._open) == 1  # only the new one; the agent's old pipe was closed
+    t0 = time.monotonic()
+    agent._request("POST", "/session/x/actions", {"x": 1})  # a gesture, not resent
+    assert time.monotonic() - t0 < 6  # "localhost" tries ::1 first (~2 s on Windows), not a ~20 s hang
+    assert _FakeWDA.seen.count("/session/x/actions") == 3  # each landed exactly once
+
+
+def test_after_wda_refuses_a_pooled_gesture_gets_the_replayable_503(relay_to_fake_wda):
+    url, where, wda, heals = relay_to_fake_wda
+    agent = WDAClient(base_url=url, timeout=5)
+    agent._request("POST", "/session/x/actions", {})  # pooled
+    wda.shutdown()
+    wda.server_close()  # WDA gone: connections to it are refused now
+    with pytest.raises(WDAUnreachable):
+        WDAClient(base_url=url, timeout=5).status()  # refused: pipes there close, heal starts
+    _wait_until(lambda: heals)
+    assert heals
+    _wait_closed(0)
+    t0 = time.monotonic()
+    with pytest.raises(WDAUnreachable):  # never reached WDA, so safe to resend
+        agent._request("POST", "/session/x/actions", {"x": 1})
+    assert time.monotonic() - t0 < 4  # a fresh connection, not a hang on the old one
+    assert _FakeWDA.seen == ["/session/x/actions"]
+
+
+def test_tunneld_down_leaves_open_pipes_alone(relay_to_fake_wda):
+    url, where, _, heals = relay_to_fake_wda
+    agent = WDAClient(base_url=url, timeout=5)
+    agent._request("POST", "/session/x/actions", {})  # pooled
+    where["address"] = link.TunneldDown("tunneld is not answering")
+    with pytest.raises(WDAUnreachable):
+        WDAClient(base_url=url, timeout=5).status()
+    _wait_until(lambda: heals)
+    assert heals and len(relay._open) == 1  # open pipes do not use tunneld
+    agent._request("POST", "/session/x/actions", {"x": 1})  # same pooled connection
+    assert _FakeWDA.seen == ["/session/x/actions"] * 2
+
+
+def test_a_close_that_fails_never_stops_the_others(monkeypatch):
+    class Broken:
+        def abort(self):
+            raise OSError("boom")
+
+    class W:
+        def __init__(self, transport):
+            self.transport = transport
+
+    closed = []
+
+    class Ok:
+        def abort(self):
+            closed.append(1)
+
+    bad = relay._Piped(W(Broken()), W(Broken()), wda=True, address="a")
+    good = relay._Piped(W(Ok()), W(Ok()), wda=True, address="a")
+    monkeypatch.setattr(relay, "_open", {bad, good})
+    relay._close_stale("b")
+    assert len(closed) == 2
+
+
+def test_pipes_on_the_current_tunnel_are_kept(monkeypatch):
+    closed = []
+
+    class T:
+        def abort(self):
+            closed.append(1)
+
+    class W:
+        transport = T()
+
+    keep = relay._Piped(W(), W(), wda=True, address="a")
+    monkeypatch.setattr(relay, "_open", {keep})
+    relay._close_stale("a")
+    assert closed == []

@@ -53,31 +53,27 @@ def _touch() -> None:
 class _Piped:
     """One client connection piped to the phone."""
 
-    def __init__(self, client_w: asyncio.StreamWriter, dev_w: asyncio.StreamWriter, wda: bool):
+    def __init__(
+        self,
+        client_w: asyncio.StreamWriter,
+        dev_w: asyncio.StreamWriter,
+        wda: bool,
+        address: str = "",
+    ):
         self.client_w, self.dev_w, self.wda = client_w, dev_w, wda
+        self.address = address  # the tunnel address this pipe leads to
         self.cut = False
-        self.cut_reason = "WDA stopped while idle"
-        # A request went to the phone and no reply byte has come back yet.
-        self.waiting = False
 
-    def drop_for_heal(self) -> None:
-        """Self-heal: WDA is out of reach on the current tunnel, so this pipe
-        leads to a WDA that is gone or about to be restarted. An idle pooled
-        connection is cut like the idle stop does, so its next request gets
-        the marked 503 (safe to resend, gestures included) instead of going
-        into a dead tunnel and hanging until TCP gives up (~20 s, seen live
-        after a USB/Wi-Fi switch). A request still waiting for its reply
-        may have reached WDA, so it cannot be answered with that 503: its
-        connection is closed now, which the client treats as a broken call."""
-        if self.waiting:
-            for w in (self.dev_w, self.client_w):
-                try:
-                    w.close()
-                except Exception:
-                    pass
-            return
-        self.cut_reason = "WDA unreachable; self-heal started"
-        self.cut_phone_side()
+    def close(self) -> None:
+        """Close both sides now. A client whose connection is idle in its pool
+        sees it closed and opens a fresh one for its next request, so nothing
+        is lost; a request still under way fails as a broken call (reads are
+        resent by the client, gestures never). Never raises."""
+        for w in (self.dev_w, self.client_w):
+            try:
+                w.transport.abort()  # close() would wait on a dead tunnel to drain
+            except Exception:
+                pass
 
     def cut_phone_side(self) -> None:
         """Idle stop: drop only the phone side of a WDA connection. HTTP
@@ -94,16 +90,29 @@ class _Piped:
 _open: set[_Piped] = set()
 
 
+def _close_stale(current: str | None, refused: str | None = None) -> None:
+    """Close pipes that lead to a WDA that is gone: those on another tunnel
+    than the current one (the link changed, e.g. USB to Wi-Fi), and those on
+    an address where WDA just refused a connection. Left open, the client's
+    next request on such a pooled connection goes into a dead tunnel and hangs
+    until TCP gives up (~20 s, seen live after a USB/Wi-Fi switch). Runs on
+    every new connection, independent of the self-heal's cooldown."""
+    for conn in list(_open):
+        if conn.address and (conn.address != current or conn.address == refused):
+            conn.close()
+
+
 async def _pipe_up(client_r: asyncio.StreamReader, conn: _Piped) -> None:
     """Client to phone. After a cut, the next request is answered, not sent."""
     try:
         while data := await client_r.read(65536):
             _touch()
             if conn.cut:
-                await _answer_unreachable(client_r, conn.client_w, conn.cut_reason, head=data)
+                await _answer_unreachable(
+                    client_r, conn.client_w, "WDA stopped while idle", head=data
+                )
                 conn.client_w.close()
                 return
-            conn.waiting = True
             conn.dev_w.write(data)
             await conn.dev_w.drain()
     except (ConnectionError, OSError, asyncio.CancelledError):
@@ -120,7 +129,6 @@ async def _pipe_down(dev_r: asyncio.StreamReader, conn: _Piped) -> None:
     try:
         while data := await dev_r.read(65536):
             _touch()
-            conn.waiting = False
             conn.client_w.write(data)
             await conn.client_w.drain()
     except (ConnectionError, OSError, asyncio.CancelledError):
@@ -221,8 +229,6 @@ def _maybe_heal() -> None:
         return
     _healing, _heal_started = True, now
     print(f"WDA unreachable through the tunnel; starting self-heal at {time.ctime()}", flush=True)
-    for conn in list(_open):
-        conn.drop_for_heal()
     asyncio.get_running_loop().run_in_executor(None, _heal)
 
 
@@ -239,8 +245,10 @@ def _handler(device_port: int):
         _touch()
         while (gate := _gate) is not None:
             await gate.wait()
+        address = None
         try:
             address = await asyncio.to_thread(_tunnel_address)
+            _close_stale(address)
             dev_r, dev_w = await asyncio.wait_for(
                 asyncio.open_connection(address, device_port), timeout=5
             )
@@ -257,11 +265,15 @@ def _handler(device_port: int):
             if reason != _last_failure:
                 _last_failure = reason
                 print(f"{time.ctime()} cannot reach the phone: {reason}", flush=True)
+            if device_port == DEVICE_WDA_PORT and address and isinstance(exc, (OSError, asyncio.TimeoutError)):
+                # Refused, or the tunnel itself is dead (connect timeout): every
+                # pipe to this address leads nowhere either.
+                _close_stale(address, refused=address)
             if device_port == DEVICE_WDA_PORT and _heals(exc):
                 _maybe_heal()
             return
         _last_failure = ""
-        conn = _Piped(client_w, dev_w, wda=device_port == DEVICE_WDA_PORT)
+        conn = _Piped(client_w, dev_w, wda=device_port == DEVICE_WDA_PORT, address=address)
         _open.add(conn)
         try:
             await asyncio.gather(_pipe_up(client_r, conn), _pipe_down(dev_r, conn))
