@@ -170,9 +170,16 @@ def _heal() -> None:
     WDA is bound to the tunnel it was started on (USE_IP), so a replug, a
     Wi-Fi reconnect or a switch between USB and Wi-Fi leaves it unreachable at
     the new tunnel address, and the MCP tools and helpers never restart it
-    themselves. Only a REFUSED connection lands here: a wedged WDA accepts the
-    connection, and restarting a wedged runner is the wrong repair (admin.up
-    handles that state itself)."""
+    themselves. Two faults land here: a REFUSED connection to WDA, and tunneld
+    not answering (link.TunneldDown), which admin.up repairs by starting
+    tunneld's scheduled task (device.start_tunnel) before it starts WDA on the
+    new tunnel. device.start_tunnel checks tunneld again right before it acts,
+    so a tunneld that answers by then is left alone, and the task's
+    MultipleInstances=IgnoreNew never lets a second copy start. A wedged WDA
+    accepts the connection and never lands here: restarting a wedged runner is
+    the wrong repair (admin.up handles that state itself). Neither does "no
+    tunnel to the phone" while tunneld answers: the phone is away, and
+    link.tunnel_for already asks tunneld for a tunnel on every lookup."""
     global _healing
     try:
         from . import admin
@@ -193,6 +200,13 @@ def _maybe_heal() -> None:
     _healing, _heal_started = True, now
     print(f"WDA unreachable through the tunnel; starting self-heal at {time.ctime()}", flush=True)
     asyncio.get_running_loop().run_in_executor(None, _heal)
+
+
+def _heals(exc: BaseException) -> bool:
+    """Whether the self-heal can repair this failure to reach WDA: WDA not
+    listening on the tunnel, or tunneld stopped. Not "no tunnel to the phone"
+    while tunneld answers (see _heal)."""
+    return isinstance(exc, link.TunneldDown) or not isinstance(exc, link.LinkError)
 
 
 def _handler(device_port: int):
@@ -219,7 +233,7 @@ def _handler(device_port: int):
             if reason != _last_failure:
                 _last_failure = reason
                 print(f"{time.ctime()} cannot reach the phone: {reason}", flush=True)
-            if device_port == DEVICE_WDA_PORT and not isinstance(exc, link.LinkError):
+            if device_port == DEVICE_WDA_PORT and _heals(exc):
                 _maybe_heal()
             return
         _last_failure = ""
