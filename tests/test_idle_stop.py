@@ -392,7 +392,7 @@ def test_no_close_during_a_heal(runner, tunneld, monkeypatch):
     assert tunneld["cancels"] == []
 
 
-def test_close_check_gates_new_connections_and_survives_tunneld_down(runner, monkeypatch):
+def test_close_check_survives_tunneld_down_without_cutting(runner, monkeypatch):
     runner["running"] = False
     monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
     pooled = _pooled()
@@ -403,7 +403,104 @@ def test_close_check_gates_new_connections_and_survives_tunneld_down(runner, mon
 
     monkeypatch.setattr(relay.link, "tunnels", down)
     asyncio.run(relay._close_check(120))  # must not raise
-    assert pooled.cut and relay._gate is None
+    assert not pooled.cut and relay._gate is None
+
+
+def test_close_check_leaves_connections_alone_while_wda_runs(runner, tunneld, monkeypatch):
+    """WDA's own idle stop (10 min) decides when its connections are cut, not the 2 min close."""
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    pooled = _pooled()
+    monkeypatch.setattr(relay, "_open", {pooled})
+    asyncio.run(relay._close_check(120))
+    assert not pooled.cut and not pooled.dev_w.closed and tunneld["cancels"] == []
+
+
+def test_close_check_cuts_connections_and_closes_the_tunnel(runner, tunneld, monkeypatch):
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    pooled = _pooled()
+    monkeypatch.setattr(relay, "_open", {pooled})
+    asyncio.run(relay._close_check(120))
+    assert pooled.cut and tunneld["cancels"] == ["UDID-1"] and relay._gate is None
+
+
+def test_an_instance_closes_only_its_own_device(runner, tunneld, monkeypatch):
+    """With SIDETAP_UDID set, other devices' tunnels belong to other instances."""
+    runner["running"] = False
+    tunneld["open"] |= {"OTHER"}
+    monkeypatch.setattr(config, "SIDETAP_UDID", "UDID-1")
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    assert relay._idle_close(120)
+    assert tunneld["cancels"] == ["UDID-1"] and tunneld["open"] == {"OTHER"}
+
+
+def test_close_waits_until_tunneld_has_dropped_the_tunnel(runner, monkeypatch):
+    """tunneld's /cancel only schedules the cancel; a caller waiting on the use
+    lock must not be handed the closing tunnel's address."""
+    runner["running"] = False
+    monkeypatch.setattr(relay, "_last_traffic", time.monotonic() - 121)
+    listings = iter([{"U": [{}]}, {"U": [{}]}, {"U": [{}]}, {}])
+    monkeypatch.setattr(relay.link, "tunnels", lambda timeout=3.0: next(listings))
+    monkeypatch.setattr(relay.link, "close_tunnel", lambda udid, timeout=5.0: True)
+    monkeypatch.setattr(relay.time, "sleep", lambda s: None)
+    assert relay._idle_close(120)
+    assert next(listings, "exhausted") == "exhausted"  # polled until the listing was empty
+
+
+def test_a_lookup_waits_for_a_close_in_progress(tmp_path, monkeypatch):
+    """tunnel_for marks use and reads the listing under the same lock the close holds."""
+    monkeypatch.setattr(relay.link, "tunnels", lambda timeout=3.0: {"U": [{"tunnel-address": "fd00::1", "tunnel-port": 1, "interface": "en0"}]})
+    done = threading.Event()
+    with relay.link.use_lock():
+        threading.Thread(target=lambda: (relay.link.tunnel_for("U"), done.set()), daemon=True).start()
+        assert not done.wait(0.3)
+    assert done.wait(3)
+
+
+def test_a_long_device_call_keeps_marking_the_device_in_use(monkeypatch):
+    monkeypatch.setattr(relay.link, "tunnels", lambda timeout=3.0: {"U": [{"tunnel-address": "fd00::1", "tunnel-port": 1, "interface": "en0"}]})
+    monkeypatch.setattr(relay.link, "_USE_HEARTBEAT", 0.05)
+    marks = []
+    monkeypatch.setattr(relay.link, "mark_used", lambda: marks.append(time.monotonic()))
+
+    class RSD:
+        def __init__(self, addr):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+    import pymobiledevice3.remote.remote_service_discovery as rsd_mod
+
+    monkeypatch.setattr(rsd_mod, "RemoteServiceDiscoveryService", RSD)
+
+    async def slow(rsd):
+        await asyncio.sleep(0.3)
+        return "done"
+
+    assert relay.link.run(slow, "U") == "done"
+    assert len(marks) >= 1 + 4 + 1  # lookup, heartbeats, end
+
+
+def test_the_watch_runs_the_tunnel_close(monkeypatch):
+    calls = []
+
+    async def wda_check(idle):
+        calls.append(("wda", idle))
+
+    async def close_check(close):
+        calls.append(("tunnel", close))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(relay, "_IDLE_CHECK", 0.01)
+    monkeypatch.setattr(relay, "_idle_check", wda_check)
+    monkeypatch.setattr(relay, "_close_check", close_check)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(relay._idle_watch(600, 120))
+    assert calls == [("wda", 600), ("tunnel", 120)]
 
 
 def test_close_tunnel_reads_tunnelds_answer(monkeypatch):

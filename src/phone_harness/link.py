@@ -63,12 +63,25 @@ def _used_file() -> Path:
     return config.STATE_DIR / "link-used"
 
 
+def use_lock():
+    """Held, across processes, while a caller marks the device in use and reads
+    tunneld's listing (tunnel_for), and while the relay closes an idle tunnel
+    (relay._idle_close). So a caller either marks in time to keep the tunnel,
+    or reads the listing only once the closed tunnel is gone from it."""
+    from . import device  # device imports this module
+
+    return device._file_lock("link-use.lock")
+
+
 def mark_used() -> None:
     """Record, across processes, that something is using the device now."""
     try:
         _used_file().touch()
     except OSError:
         pass  # a missing mark only lets an idle tunnel close sooner
+
+
+_USE_HEARTBEAT = 30.0  # seconds between two marks while a device call runs
 
 
 def used_age() -> float | None:
@@ -183,8 +196,9 @@ def tunnel_for(udid: str | None = None) -> tuple[str, int, str]:
     Every device call comes through here, so it also marks the device as in use,
     which keeps the relay from closing an idle tunnel under it."""
     global _last_request
-    mark_used()
-    listing = tunnels()
+    with use_lock():
+        mark_used()
+        listing = tunnels()
     if udid is None:
         udid = config.SIDETAP_UDID or (sorted(listing)[0] if listing else None)
     entries = listing.get(udid or "", [])
@@ -235,13 +249,25 @@ def run(fn: Callable[[Any], Awaitable[T]], udid: str | None = None, timeout: flo
 
     address, port, _ = tunnel_for(udid)
 
+    async def heartbeat() -> None:
+        # a long call (a DDI mount allows 300 s) must keep the relay from
+        # closing the tunnel under it
+        while True:
+            await asyncio.sleep(_USE_HEARTBEAT)
+            mark_used()
+
     async def main() -> T:
+        beat = asyncio.create_task(heartbeat())
         rsd = RemoteServiceDiscoveryService((address, port))
-        await rsd.connect()
         try:
-            return await fn(rsd)
+            await rsd.connect()
+            try:
+                return await fn(rsd)
+            finally:
+                await rsd.close()
         finally:
-            await rsd.close()
+            beat.cancel()
+            mark_used()
 
     async def bounded() -> T:
         return await asyncio.wait_for(main(), timeout)

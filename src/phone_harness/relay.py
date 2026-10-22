@@ -274,6 +274,31 @@ def _idle_stop(idle_seconds: float) -> bool:
     return True
 
 
+_CLOSE_WAIT = 5.0  # seconds to wait for tunneld to drop a cancelled tunnel
+
+
+def _closable(close_seconds: float) -> bool:
+    """Whether the device has been idle for `close_seconds`: no relay traffic,
+    WDA not running, and no device call in any process (link.used_age)."""
+    from . import device
+
+    if _healing or time.monotonic() - _last_traffic < close_seconds:
+        return False
+    if device.proc_status("runwda") == "running":
+        return False
+    age = link.used_age()
+    return age is None or age >= close_seconds
+
+
+def _own_tunnels() -> list[str]:
+    """The UDIDs whose tunnels this instance may close: its own device when
+    SIDETAP_UDID pins one (other instances own the rest), else every listed one."""
+    listed = list(link.tunnels())
+    if config.SIDETAP_UDID:
+        return [u for u in listed if u == config.SIDETAP_UDID]
+    return listed
+
+
 def _idle_close(close_seconds: float) -> bool:
     """Close the device's tunnel once WDA is stopped and nothing, in any
     process, has used the device for `close_seconds`.
@@ -286,16 +311,18 @@ def _idle_close(close_seconds: float) -> bool:
     global _cached
     from . import device
 
-    with _lifecycle, device.wda_lifecycle_lock():
-        if _healing or time.monotonic() - _last_traffic < close_seconds:
+    with _lifecycle, device.wda_lifecycle_lock(), link.use_lock():
+        if not _closable(close_seconds):
             return False
-        if device.proc_status("runwda") == "running":
-            return False
-        age = link.used_age()
-        if age is not None and age < close_seconds:
-            return False
-        closed = [udid for udid in link.tunnels() if link.close_tunnel(udid)]
+        closed = [udid for udid in _own_tunnels() if link.close_tunnel(udid)]
         _cached = None
+        # tunneld only schedules the cancel; hold the lock until the tunnel has
+        # left its listing, so no caller is handed the closing tunnel's address
+        deadline = time.monotonic() + _CLOSE_WAIT
+        while closed and time.monotonic() < deadline:
+            if not set(closed) & set(link.tunnels()):
+                break
+            time.sleep(0.2)
     if closed:
         print(f"{time.ctime()} device idle for {close_seconds / 60:g} min; closed its tunnel", flush=True)
     return bool(closed)
@@ -307,6 +334,13 @@ async def _close_check(close_seconds: float) -> None:
     it as it goes away. Open connections are cut on the phone side."""
     global _gate
     if _gate is not None or _healing or time.monotonic() - _last_traffic < close_seconds:
+        return
+    try:
+        # decide before cutting anything: a running WDA, a call in another
+        # process or an already closed tunnel leaves every connection alone
+        if not await asyncio.to_thread(lambda: _closable(close_seconds) and bool(_own_tunnels())):
+            return
+    except link.LinkError:  # tunneld down: no tunnel to close, and the self-heal owns it
         return
     _gate = asyncio.Event()
     for conn in list(_open):
