@@ -947,7 +947,6 @@ def sign_app(  # noqa: vulture  (used by signing.py)
     profile: Path,
     p12password: str = "",
     bundleid: str | None = None,
-    install: bool = True,
 ) -> str:
     """Sign an IPA (nested .xctest included) and install it through the tunnel.
 
@@ -989,11 +988,10 @@ def sign_app(  # noqa: vulture  (used by signing.py)
         out = (proc.stdout + proc.stderr).strip()
         if proc.returncode != 0:
             raise DeviceError(f"wda-sign failed:\n{out[-1200:]}")
-        if install:
-            if not signed.exists():
-                raise DeviceError(f"wda-sign wrote nothing to {signed}:\n{out[-1200:]}")
-            try:
-                link.install_app(signed, current_udid())
-            except Exception as exc:  # LinkError, AppInstallError: named, not swallowed
-                raise DeviceError(f"installing the signed app failed: {exc}") from exc
+        if not signed.exists():
+            raise DeviceError(f"wda-sign wrote nothing to {signed}:\n{out[-1200:]}")
+        try:
+            link.install_app(signed, current_udid())
+        except Exception as exc:  # LinkError, AppInstallError: named, not swallowed
+            raise DeviceError(f"installing the signed app failed: {exc}") from exc
     return out

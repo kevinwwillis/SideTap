@@ -50,11 +50,6 @@ def test_signs_with_wda_sign_and_installs_through_the_tunnel(signer, tmp_path):
     assert out == "signed ok"
 
 
-def test_install_false_signs_only(signer, tmp_path):
-    device.sign_app(tmp_path / "a.ipa", tmp_path / "id.p12", tmp_path / "p.mobileprovision", install=False)
-    assert len(signer["sign"]) == 1 and signer["install"] == []
-
-
 def test_a_failed_sign_installs_nothing(signer, monkeypatch, tmp_path):
     monkeypatch.setattr(device.subprocess, "run",
                         lambda args, **k: subprocess.CompletedProcess(args, 1, "", "provisioning profile has expired"))

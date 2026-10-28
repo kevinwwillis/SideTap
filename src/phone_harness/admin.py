@@ -30,7 +30,7 @@ def _check_go_ios():
         return True, f"go-ios found: {path}", ""
     return (
         False,
-        "go-ios (`ios`) not on PATH (needed only to re-sign WDA: fix-input)",
+        "go-ios (`ios`) not on PATH (used only by scripts/collect_wedge_logs.ps1; fix-input signs with wda-sign)",
         "Install Node.js, then: npm install -g go-ios",
     )
 
