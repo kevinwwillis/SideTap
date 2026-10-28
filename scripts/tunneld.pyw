@@ -18,12 +18,6 @@ the Wi-Fi tunnel adapter on this PC came and went about once a minute.
 pythonw has no console, so stdout and stderr go to a log file that is cut back to
 its last 2 MB at each start.
 
-STOPGAP until pymobiledevice3 fixes it upstream (doronz88/pymobiledevice3#2051): tunneld runs inside
-uvicorn with loop="asyncio", which on Windows always builds a ProactorEventLoop, and
-the Bonjour browse that finds the iPad on Wi-Fi gets no answers on that loop
-(checked 2026-10-18: found in 0 of 14 browses on the proactor loop, 11 of 16 on the selector).
-pymobiledevice3 already sets the selector policy for itself; loop="none" makes uvicorn
-use it. Remove this patch once a pymobiledevice3 release passes loop="none" on Windows.
 """
 
 import sys
@@ -38,19 +32,6 @@ if LOG.exists() and LOG.stat().st_size > KEEP:
     LOG.write_bytes(LOG.read_bytes()[-KEEP:])
 log = open(LOG, "a", encoding="utf-8", buffering=1)
 sys.stdout = sys.stderr = log
-
-import uvicorn  # noqa: E402
-
-_run = uvicorn.run
-
-
-def _run_with_policy_loop(*args, **kwargs):
-    if sys.platform == "win32" and kwargs.get("loop") == "asyncio":
-        kwargs["loop"] = "none"
-    return _run(*args, **kwargs)
-
-
-uvicorn.run = _run_with_policy_loop
 
 from pymobiledevice3.__main__ import main  # noqa: E402
 

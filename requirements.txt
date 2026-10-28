@@ -7,7 +7,7 @@ mcp>=1.9,<2
 # Wi-Fi (link.py), plus the provisioning profile `fix-input` reads back off the
 # phone. 11.36 is the release the tunneld API calls were checked against; its
 # TCP tunnel needs Python 3.13 or later.
-pymobiledevice3>=11.36
+pymobiledevice3>=11.45.1
 # Checks that a pid in .state/ is still the process SideTap started before it
 # is killed or trusted (Windows reuses pids).
 psutil>=5.9
