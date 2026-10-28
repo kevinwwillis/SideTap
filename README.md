@@ -184,7 +184,7 @@ Sideloading WebDriverAgent with a free Apple ID installs the app, but the test r
 
 1. Builds a `.p12` from Sideloadly's own cert and key (openssl, local files).
 2. Reads the freshly minted provisioning profile back off the **phone**. Sideloadly signs in memory and never writes the profile to disk, but iOS keeps every installed profile at `/var/MobileDevice/ProvisioningProfiles/`, so the profile is pulled over USB (pymobiledevice3) instead of watched for on your PC.
-3. Re-signs the whole IPA with go-ios `ios sign app`, which signs the nested `.xctest` with the same Team ID, then installs.
+3. Re-signs the whole IPA with go-ios's signer (`tools/wda-sign`, built by `scripts/build_wda_sign.ps1`), which signs the nested `.xctest` with the same Team ID, then installs it through the tunnel, over USB or Wi-Fi.
 
 No Apple servers are contacted, no Apple password is scripted, no session tokens are reused. The 7-day free-ID expiry still applies; the doctor counts it down and one command re-signs.
 

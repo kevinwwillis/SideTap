@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -83,6 +84,15 @@ def ios_path() -> str | None:
         Path(os.environ.get("LOCALAPPDATA", "")) / "SideTap" / "bin" / "ios.exe"
     )
     return str(installer_exe) if installer_exe.is_file() else None
+
+
+def wda_sign_path() -> str | None:
+    """tools/wda-sign, built by scripts/build_wda_sign.ps1 next to the installer's ios.exe."""
+    found = shutil.which("wda-sign")
+    if found:
+        return found
+    built = Path(os.environ.get("LOCALAPPDATA", "")) / "SideTap" / "bin" / "wda-sign.exe"
+    return str(built) if built.is_file() else None
 
 
 def pin_udid(args: list[str]) -> list[str]:
@@ -939,28 +949,51 @@ def sign_app(  # noqa: vulture  (used by signing.py)
     bundleid: str | None = None,
     install: bool = True,
 ) -> str:
-    """Sign an IPA (nested .xctest included) with `ios sign app` and install it.
+    """Sign an IPA (nested .xctest included) and install it through the tunnel.
 
-    This is the step Sideloadly skips: go-ios re-signs the nested
+    This is the step Sideloadly skips: go-ios's signer re-signs the nested
     WebDriverAgentRunner.xctest with the same Team ID as the host app, which is
     what iOS Library Validation requires. `bundleid` overrides the app's bundle
-    id so it matches the provisioning profile. Returns the combined go-ios output.
+    id so it matches the provisioning profile. Returns the signer's output.
+
+    It runs that signer through `wda-sign` (tools/wda-sign), not `ios sign app`:
+    go-ios looks the phone up on usbmux before it signs, so a re-sign needed the
+    cable. The install goes through the tunnel (`link.install_app`) for the
+    same reason, so both work with the phone on Wi-Fi only.
     """
-    args = [
-        "sign",
-        "app",
-        f"--path={ipa}",
-        f"--p12file={p12}",
-        f"--profile={profile}",
-    ]
-    if p12password:
-        args.append(f"--p12password={p12password}")
-    if bundleid:
-        args.append(f"--bundleid={bundleid}")
-    if install:
-        args.append("--install")
-    proc = _run(args, timeout=300)
-    out = (proc.stdout + proc.stderr).strip()
-    if proc.returncode != 0:
-        raise DeviceError(f"`ios sign app` failed:\n{out[-1200:]}")
+    exe = wda_sign_path()
+    if not exe:
+        raise DeviceError(
+            "wda-sign not found. Build it: scripts/build_wda_sign.ps1 (needs Go)"
+        )
+    with tempfile.TemporaryDirectory(prefix="sidetap-sign-") as tmp:
+        signed = Path(tmp) / Path(ipa).name
+        args = [
+            exe,
+            f"--path={ipa}",
+            f"--output={signed}",
+            f"--p12file={p12}",
+            f"--profile={profile}",
+        ]
+        if p12password:
+            args.append(f"--p12password={p12password}")
+        if bundleid:
+            args.append(f"--bundleid={bundleid}")
+        proc = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        out = (proc.stdout + proc.stderr).strip()
+        if proc.returncode != 0:
+            raise DeviceError(f"wda-sign failed:\n{out[-1200:]}")
+        if install:
+            if not signed.exists():
+                raise DeviceError(f"wda-sign wrote nothing to {signed}:\n{out[-1200:]}")
+            try:
+                link.install_app(signed, current_udid())
+            except Exception as exc:  # LinkError, AppInstallError: named, not swallowed
+                raise DeviceError(f"installing the signed app failed: {exc}") from exc
     return out

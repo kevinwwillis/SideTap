@@ -243,6 +243,19 @@ def list_apps() -> list[dict]:
     ]
 
 
+def install_app(package: Path | str, udid: str | None = None, timeout: float = 300.0) -> None:
+    """Install an .ipa (or .app folder) through the tunnel, so over USB or Wi-Fi alike.
+
+    go-ios's own install goes through usbmux, which reaches the phone only on the cable.
+    """
+    from pymobiledevice3.services.installation_proxy import InstallationProxyService
+
+    async def fn(rsd):
+        await InstallationProxyService(lockdown=rsd).install_from_local(Path(package))
+
+    run(fn, udid, timeout=timeout)
+
+
 def running_apps() -> list[dict]:
     """Processes that are applications: [{name, pid, started}], as go-ios `ps` gave."""
     from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
